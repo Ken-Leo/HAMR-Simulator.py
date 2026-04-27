@@ -1,0 +1,95 @@
+{
+  "total_elapsed": 57.3383412361145,
+  "results": {
+    "Exp1: Channel Impulse Response": {},
+    "Exp2: LPF Frequency Response": {},
+    "Exp3: FIR Filter Verification": {
+      "nc_mean_error": 0.0,
+      "nc_max_error": 0.0,
+      "c_mean_error": 0.0,
+      "c_max_error": 0.0
+    },
+    "Exp4: RLL(4/5) Code Analysis": {},
+    "Exp5: BER vs SNR (Viterbi)": {
+      "ber_points": {
+        "Longitudinal ": [
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139,
+          0.5138613861386139
+        ],
+        "Perpendicular ": [
+          0.5148514851485149,
+          0.5148514851485149,
+          0.5148514851485149,
+          0.5148514851485149,
+          0.5148514851485149,
+          0.5148514851485149,
+          0.5158415841584159,
+          0.5158415841584159
+        ]
+      },
+      "ser_points": {
+        "Longitudinal ": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "Perpendicular ": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "Perpendicular (RLL(4/5))": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    "Exp6: SOVA Soft Output": {},
+    "Exp7: Equalizer Convergence": {
+      "mse_initial": 343.0724973455812,
+      "mse_final": 4.240420316425237e-21,
+      "improvement_ratio": 8.09053046031056e+22
+    },
+    "Exp8: GPR Target Adaptation": {},
+    "Exp9: Encoding Overhead": {},
+    "Exp10: LCG RNG Analysis": {},
+    "Exp11: Viterbi vs SOVA": {},
+    "Exp12: Full Pipeline": {
+      "bers": {
+        "No Encoding": 0.5148514851485149,
+        "RLL(4/5)": 0.5316831683168317,
+        "MTR(6/7)": 0.48056872037914694,
+        "TMTR(8/9)": 0.4772511848341232
+      },
+      "sers": {
+        "No Encoding": 1.0,
+        "RLL(4/5)": 1.0,
+        "MTR(6/7)": 1.0,
+        "TMTR(8/9)": 1.0
+      }
+    },
+    "Exp13: All Codes Comparison": {}
+  }
+}
