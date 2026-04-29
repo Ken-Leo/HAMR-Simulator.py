@@ -142,84 +142,172 @@ def lpf(
 
 def adapt_equalizer(
     equalized_output: np.ndarray,
-    padded_eq_output: np.ndarray,
+    desired_output: np.ndarray,
     eq_coeff: np.ndarray,
     num_eq_taps: int,
     sector_length: int,
-    pri_imp_res: np.ndarray,
-    pri_imp_res_length: int,
+    pri_imp_res: np.ndarray | None = None,
+    pri_imp_res_length: int = 0,
     start_flag: int = 1,
+    use_nlms: bool = True,
 ) -> Tuple[float, float]:
-    """LMS adaptive equalizer.
+    """Adaptive equalizer (LMS / NLMS).
 
-    Updates ``eq_coeff`` in-place and returns the MSE and LMS error
+    Updates ``eq_coeff`` in-place and returns the MSE and average error
     for the current sector.
+
+    Supervised mode (default): uses *desired_output* as the training
+    target.  Falls back to the original blind PR-target mode when
+    ``desired_output`` is ``None``.
 
     Parameters
     ----------
     equalized_output : np.ndarray
-        Raw channel output (DSChannelOutput equivalent).
-    padded_eq_output : np.ndarray
-        Already-equalized output used to compute the PR target.
+        Raw channel output (received samples).
+    desired_output : np.ndarray | None
+        Desired (training) signal.  If ``None``, the function reverts
+        to the original blind PR-target equalization.
     eq_coeff : np.ndarray
         Equalizer coefficients (updated in-place).
     num_eq_taps : int
         Number of equalizer taps.
     sector_length : int
-        Number of samples in the sector.
-    pri_imp_res : np.ndarray
-        PR target impulse response.
+        Number of samples to process.
+    pri_imp_res : np.ndarray | None
+        PR target impulse response (used only in blind mode).
     pri_imp_res_length : int
-        Length of the PR impulse response.
+        Length of the PR impulse response (used only in blind mode).
     start_flag : int
         If non-zero, re-initialise equalizer coefficients.
+    use_nlms : bool
+        When ``True`` (default) use Normalised LMS for stable convergence.
 
     Returns
     -------
     tuple[float, float]
-        (MSE, average_LMS_error) for the sector.
+        (MSE, average_error) for the sector.
     """
     # Initialise equalizer coefficients on start
     if start_flag:
         eq_coeff[:] = 0.0
 
-    # --- PR target output (causal FIR of equalized_output) ---
-    pr_actual_output = causal_fir(equalized_output, sector_length, pri_imp_res)
+    supervised = desired_output is not None
 
-    # --- Equalizer output (non-causal FIR of equalized_output) ---
-    eq_output_temp = non_causal_fir(equalized_output, sector_length, eq_coeff)
+    if supervised:
+        _adapt_equalizer_supervised(
+            equalized_output, desired_output, eq_coeff,
+            num_eq_taps, sector_length, use_nlms,
+        )
+        # Compute MSE against desired output
+        front_pad = num_eq_taps // 2
+        padded_ds = np.zeros(sector_length + num_eq_taps - 1)
+        padded_ds[front_pad: front_pad + sector_length] = equalized_output[
+            :sector_length
+        ]
+        eq_out = np.zeros(sector_length, dtype=np.float64)
+        for i in range(sector_length):
+            for j in range(num_eq_taps):
+                eq_out[i] += eq_coeff[j] * padded_ds[i + j]
+        diff = eq_out - desired_output[:sector_length]
+        mse = float(np.sum(diff * diff))
+        avg_err = float(np.mean(np.abs(diff))) if sector_length > 0 else 0.0
+    else:
+        # Blind PR-target mode (original C behaviour)
+        if pri_imp_res is None:
+            pri_imp_res = np.array([1.0])
+            pri_imp_res_length = 1
+        pr_actual_output = causal_fir(
+            equalized_output, sector_length, pri_imp_res)
+        eq_output_temp = non_causal_fir(
+            equalized_output, sector_length, eq_coeff)
 
-    # --- LMS coefficient update ---
-    # Pad the channel output for the equaliser
+        front_pad = num_eq_taps // 2
+        back_pad = num_eq_taps - 1
+        padded_len = sector_length + front_pad + back_pad
+        padded_ds = np.zeros(padded_len)
+        padded_ds[front_pad: front_pad + sector_length] = equalized_output[
+            :sector_length
+        ]
+
+        lmse_total = 0.0
+        for i in range(sector_length):
+            eq_output = 0.0
+            for j in range(num_eq_taps):
+                eq_output += eq_coeff[j] * padded_ds[i + j]
+
+            eq_error = eq_output - pr_actual_output[i]
+            lmse_total += eq_error * eq_error
+
+            for j in range(num_eq_taps):
+                eq_coeff[j] -= (
+                    2.0 * LMS_STEP_SIZE * eq_error * padded_ds[i + j])
+
+        mse = 0.0
+        for i in range(sector_length):
+            diff = pr_actual_output[i] - eq_output_temp[i]
+            mse += diff * diff
+
+        avg_err = lmse_total / sector_length if sector_length > 0 else 0.0
+
+    return float(mse), float(avg_err)
+
+
+def _adapt_equalizer_supervised(
+    equalized_output: np.ndarray,
+    desired_output: np.ndarray,
+    eq_coeff: np.ndarray,
+    num_eq_taps: int,
+    sector_length: int,
+    use_nlms: bool = True,
+) -> None:
+    """Supervised (training-based) adaptive equalizer.
+
+    Uses NLMS (Normalised LMS) by default for stable convergence.
+    Falls back to plain LMS when *use_nlms* is ``False``.
+
+    Parameters
+    ----------
+    equalized_output : np.ndarray
+        Received (channel-affected) samples.
+    desired_output : np.ndarray
+        Desired training samples (same length as equalized_output).
+    eq_coeff : np.ndarray
+        Equalizer coefficients array (modified in-place).
+    num_eq_taps : int
+        Number of taps.
+    sector_length : int
+        Number of samples to process.
+    use_nlms : bool
+        Use normalised step size for robustness.
+    """
+    # Pad input
     front_pad = num_eq_taps // 2
-    back_pad = num_eq_taps - 1
-    padded_len = sector_length + front_pad + back_pad
-    padded_ds = np.zeros(padded_len)
-    padded_ds[front_pad : front_pad + sector_length] = equalized_output[
+    padded_ds = np.zeros(sector_length + num_eq_taps - 1)
+    padded_ds[front_pad: front_pad + sector_length] = equalized_output[
         :sector_length
     ]
 
-    lmse_total = 0.0
-    for i in range(sector_length):
-        eq_output = 0.0
-        for j in range(num_eq_taps):
-            eq_output += eq_coeff[j] * padded_ds[i + j]
+    desired = desired_output[:sector_length]
 
-        eq_error = eq_output - pr_actual_output[i]
-        lmse_total += eq_error * eq_error
+    if use_nlms:
+        # --- NLMS: normalised LMS ---
+        mu = 2.0 * LMS_STEP_SIZE  # scale factor (max step = mu)
+        for i in range(sector_length):
+            x = padded_ds[i: i + num_eq_taps].copy()
+            eq_out = eq_coeff @ x
+            error = eq_out - desired[i]
 
-        for j in range(num_eq_taps):
-            eq_coeff[j] -= 2.0 * LMS_STEP_SIZE * eq_error * padded_ds[i + j]
-
-    # --- MSE computation ---
-    mse = 0.0
-    for i in range(sector_length):
-        diff = pr_actual_output[i] - eq_output_temp[i]
-        mse += diff * diff
-
-    avg_lmse = lmse_total / sector_length if sector_length > 0 else 0.0
-
-    return float(mse), float(avg_lmse)
+            norm = np.dot(x, x) + NLMS_EPSILON
+            update = (mu / norm) * error * x
+            eq_coeff[:num_eq_taps] -= update
+    else:
+        # --- Plain LMS (for API compatibility with blind mode) ---
+        mu = 2.0 * LMS_STEP_SIZE
+        for i in range(sector_length):
+            x = padded_ds[i: i + num_eq_taps].copy()
+            eq_out = eq_coeff @ x
+            error = eq_out - desired[i]
+            eq_coeff[:num_eq_taps] -= mu * error * x
 
 
 def apply_equalizer(

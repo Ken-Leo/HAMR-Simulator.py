@@ -366,12 +366,19 @@ python experiments/run_experiments.py
    - All-ones: 4% BER (boundary effects only)
    - Alternating [1,0,1,0...]: 50% BER (expected - EPR4 cancellation)
 
-2. **Full pipeline (channel + equalizer + Viterbi)**: The GPR equalizer
-   trained at 50dB produces ~54% BER at lower SNRs. Investigation ongoing:
-   - The equalizer coefficients may not properly invert the channel
-   - The simplified `find_gpr_target` differs from the C `FindGPRTarget`
-   - The C code uses a more sophisticated optimization (matrix inversions)
+2. **Real channel + GPR equalizer**: The `find_gpr_target` function is a
+   simplified version that does not match the C `FindGPRTarget()`. The C
+   code uses matrix inversion and Lagrange multiplier constraints for
+   optimal GPR target computation. The Python implementation produces
+   ~54% BER on perpendicular/longitudinal channels. For Phase B of exp5,
+   a synthetic mild-ISI channel is used instead, which demonstrates LMS
+   equalizer convergence correctly.
 
-3. **PR target**: Changed from `[1,0,-1]` to EPR4 `[1,1,-1,-1]` to match
+3. **PR[1,2,1] weak trellis**: PR[1,2,1] has "weak trellis" states where
+   multiple states share the same sample pairs but have different
+   predecessors, causing detection ambiguity. BER stays at ~37% regardless
+   of SNR.
+
+4. **PR target**: Changed from `[1,0,-1]` to EPR4 `[1,1,-1,-1]` to match
    the C code default. PR[1,0,-1] was found to have no trellis ambiguities
    but produces poor detector performance on most patterns.

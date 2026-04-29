@@ -59,6 +59,8 @@ SECTOR_512B = 4097  # 4×1024+1, ≈512 bytes
 
 PRI_IMP = np.array([1, 1, -1, -1], dtype=np.float64)  # EPR4 (matches C code)
 NUM_EQ_TAPS = 21
+PRE = 20  # preamble/postamble length (matches C PREAMBLE_LENGTH)
+OSR = 10  # oversampling rate
 
 
 def save_fig(name: str, dpi: int = 200) -> None:
@@ -608,97 +610,285 @@ def _get_decoder_for_encoder(enc_fn):
     return dec_4by5rll_code, 4
 
 
+def _causal_fir(data: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """Causal FIR: y[n] = sum h[k]*x[n-k], output length = len(data)."""
+    data = np.asarray(data, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    pad_len = len(h) - 1
+    total = len(data) + 2 * pad_len
+    padded = np.zeros(total, dtype=np.float64)
+    padded[pad_len: pad_len + len(data)] = data
+    out = np.zeros(len(data), dtype=np.float64)
+    for i in range(pad_len, len(data) + pad_len):
+        s = 0.0
+        for j in range(len(h)):
+            s += h[j] * padded[i - j]
+        out[i - pad_len] = s
+    return out
+
+
+def _generate_sector(
+    bits: np.ndarray,
+    ch_type: str,
+    snr_db: float,
+    trial_seed: int,
+    noise_seed: int,
+    sector_len: int = SECTOR_512B,
+) -> tuple[np.ndarray, int]:
+    """Generate one sector through the perpendicular channel.
+
+    Returns (ds_inner, enc_len).
+    """
+    enc_len = len(bits)
+    padded = np.zeros(PRE + enc_len + PRE, dtype=np.int64)
+    padded[PRE: PRE + enc_len] = bits
+    bipolar = make_bipolar(padded)
+
+    oss_len = (PRE + enc_len + PRE) * OSR
+    ch_out = channel(bipolar, ch_type, 2.5, 201, OSR, 0.0, 0.0, {}, trial_seed)
+
+    noise_sigma = math.sqrt(OSR) * 10 ** (-snr_db / 20) * 2 * math.sqrt(2.5 / 2)
+    noise = np.array(
+        [gaussian_random(uniform_random(noise_seed + i)) for i in range(oss_len)],
+        dtype=np.float64,
+    )
+    inner_start = PRE * OSR
+    inner_stop = oss_len - PRE * OSR
+    ch_out[inner_start: inner_stop] += (
+        noise[inner_start: inner_stop] * noise_sigma
+    )
+
+    lpf_out = lpf(ch_out[:oss_len], 20, 1.0 / OSR)
+    ds = lpf_out[::OSR][:PRE + enc_len + PRE]
+
+    return ds[PRE: PRE + enc_len], enc_len
+
+
+def _synthetic_pr_channel(
+    bits: np.ndarray,
+    channel_target: np.ndarray,
+    snr_db: float,
+    noise_seed: int,
+) -> np.ndarray:
+    """Synthetic PR channel: convolve with channel_target + AWGN.
+
+    Args:
+        bits: Binary bits (0/1).
+        channel_target: Channel impulse response (e.g. [1, 0.5] for mild ISI).
+        snr_db: SNR in dB.
+        noise_seed: RNG seed for reproducibility.
+
+    Returns:
+        Noisy channel output (same length as bits).
+    """
+    bipolar = make_bipolar(bits)
+    # Causal convolution, same-length output (matches _causal_fir)
+    signal = _causal_fir(bipolar, channel_target)
+    sig_power = np.mean(signal ** 2)
+    snr_lin = 10 ** (snr_db / 10)
+    noise_std = math.sqrt(sig_power / snr_lin)
+
+    rng = np.random.RandomState(noise_seed)
+    noise = rng.randn(len(signal)) * noise_std
+    return signal + noise
+
+
 def exp5_ber_snr_viterbi():
-    """Experiment 5: BER vs SNR curves for different channel/encoding
-    combinations using Viterbi detector with GPR fixed equalizer."""
-    print("\n[EXP5] BER vs SNR (Viterbi)")
+    """Experiment 5: Viterbi Detector Performance Validation.
+
+    Phase A -- Clean PR-targeted signal + AWGN: BER vs SNR for different
+    PR targets (EPR4, PR[1,0,-1], PR[1,-1], PR[1,2,1]).
+
+    Phase B -- Synthetic mild-ISI channel + LMS adaptive equalizer:
+    BER vs SNR for EPR4 and PR[1,0,-1] detectors on a channel that
+    introduces mild ISI ([1, 0.5] channel), demonstrating how equalizer
+    adaptation restores detector performance.
+    """
+    print("\n" + "=" * 60)
+    print("EXP5: Viterbi Detector Performance Validation")
+    print("=" * 60)
     t = time.time()
 
-    snr_range = np.arange(24, 41, 2)  # 24, 26, ..., 40 dB
-    num_sectors = 50
-    num_eq_sectors = 20
-    sector_len = SECTOR_512B  # 4097 bits (~512 bytes, 4Z+1 for RLL(4/5))
+    # ------------------------------------------------------------------
+    # Phase A: Clean signal BER vs SNR
+    # ------------------------------------------------------------------
+    print("\n[EXP5 Phase A] Clean Signal BER vs SNR")
+    phase_a_t = time.time()
 
-    configs = [
-        ("Perpendicular", "No Encoding", False, None),
-        ("Perpendicular", "RLL(4/5)", True, enc_4by5rll_code),
+    targets_a = {
+        "EPR4": np.array([1.0, 1.0, -1.0, -1.0]),
+        "PR[1,0,-1]": np.array([1.0, 0.0, -1.0]),
+        "PR[1,-1]": np.array([1.0, -1.0]),
+        "PR[1,2,1]": np.array([1.0, 2.0, 1.0]),
+    }
+
+    np.random.seed(42)
+    n_a = 200
+    bits_a = np.random.randint(0, 2, n_a)
+
+    fig_a, axes_a = plt.subplots(1, 2, figsize=(14, 5))
+    ber_results_a = {}
+    snr_range_a = np.arange(6, 26, 2)
+
+    for name, target in targets_a.items():
+        bits_bipolar_a = make_bipolar(bits_a)
+        clean_signal = _causal_fir(bits_bipolar_a, target)
+        sig_power = np.mean(clean_signal[:n_a] ** 2)
+
+        ber_curve = []
+        for snr_db in snr_range_a:
+            snr_lin = 10 ** (snr_db / 10)
+            noise_std = math.sqrt(sig_power / snr_lin)
+
+            noisy = clean_signal[:n_a].copy()
+            np.random.seed(42)
+            noisy += np.random.randn(n_a) * noise_std
+
+            det, _ = classical_viterbi(2, noisy, n_a, target)
+            errs = int(np.sum(det[:n_a] != bits_a))
+            ber_curve.append(errs / n_a)
+
+        axes_a[0].semilogy(snr_range_a, ber_curve, "o-",
+                           label=name, linewidth=2, markersize=8)
+        ber_results_a[name] = dict(zip(snr_range_a.tolist(), ber_curve))
+
+    axes_a[0].set_xlabel("SNR (dB)")
+    axes_a[0].set_ylabel("BER")
+    axes_a[0].set_title("Phase A: Clean Signal - BER vs SNR")
+    axes_a[0].legend()
+    axes_a[0].grid(True, alpha=0.3)
+
+    snr_check = [8, 16, 24]
+    for name in ber_results_a:
+        row = [ber_results_a[name].get(s, -1) for s in snr_check]
+        print(f"  {name:>12s}: SNR={snr_check[0]}={row[0]:.4e}  "
+              f"{snr_check[1]}={row[1]:.4e}  {snr_check[2]}={row[2]:.4e}")
+
+    axes_a[1].axis("off")
+    axes_a[1].set_title("Phase A: BER Table (200 bits, clean PR signal)")
+    table_data = []
+    for name in ber_results_a:
+        for s in snr_check:
+            v = ber_results_a[name].get(s, -1)
+            table_data.append([f"{name} @ {s}dB: {v:.4e}" if v >= 0 else f"{name} @ {s}dB: N/A"])
+    axes_a[1].table(table_data, loc="center", cellLoc="left")
+
+    save_fig("exp5_phase_a_clean_ber.png", dpi=200)
+    print(f"  Phase A done in {time.time() - phase_a_t:.2f}s")
+
+    with open(RESULTS / "exp5_phase_a_results.json", "w") as f:
+        json.dump(ber_results_a, f, indent=2)
+    print(f"  Saved exp5_phase_a_results.json")
+
+    # ------------------------------------------------------------------
+    # Phase B: Synthetic mild-ISI channel + LMS adaptive equalizer
+    # ------------------------------------------------------------------
+    print("\n[EXP5 Phase B] Synthetic ISI Channel + LMS Equalizer")
+    phase_b_t = time.time()
+
+    snr_range_b = np.arange(10, 30, 2)
+    num_trials = 100
+    sector_len = 512
+
+    # Mild-ISI channel: each bit leaks 0.5 into the next position
+    channel_target = np.array([1.0, 0.5])
+
+    # Detection targets (PR targets for Viterbi)
+    configs_b = [
+        ("EPR4", np.array([1.0, 1.0, -1.0, -1.0]), 2),
+        ("PR[1,0,-1]", np.array([1.0, 0.0, -1.0]), 2),
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig_b, axes_b = plt.subplots(1, 2, figsize=(14, 5))
+    all_ber_b = {}
+    all_mse_b = {}
 
-    all_ber = {}
-    all_ser = {}
-
-    # Pre-compute GPR target/coeffs for each config (one-time, matches C GPRTarget mode)
-    gpr_cache: dict = {}
-    for ch_type, enc_name, use_enc, enc_fn in configs:
-        key = (ch_type, enc_fn)
-        if key not in gpr_cache:
-            print(f"  Computing GPR target for {enc_name} ...")
-            gpr_target, eq_coeff = compute_gpr_target_for_sweep(
-                ch_type, enc_fn, sector_len, num_eq_sectors=num_eq_sectors)
-            gpr_cache[key] = (gpr_target, eq_coeff)
-
-    for ax_idx, (ch_type, enc_name, use_enc, enc_fn) in enumerate(configs):
-        if ax_idx >= 1:
-            continue
-        ax = axes[ax_idx]
-        label = f"{ch_type} {'(' + enc_name + ')' if enc_name != 'None' else ''}"
-        gpr_target, eq_coeff = gpr_cache[(ch_type, enc_fn)]
+    for label, pri, delay in configs_b:
         ber_points = []
-        for snr in snr_range:
-            ber, _, _ = run_single_sector_sweep(
-                ch_type, enc_fn, sector_len, snr, num_sectors,
-                eq_coeff_init=eq_coeff, gpr_target_init=gpr_target)
+        mse_points = []
+
+        for snr in snr_range_b:
+            total_bits = 0
+            total_errors = 0
+            total_mse = 0.0
+
+            for trial in range(num_trials):
+                bits = np.array(
+                    [int(uniform_random(-500 - trial * 100 + i).random() > 0.5)
+                     for i in range(sector_len)],
+                    dtype=np.int64,
+                )
+                bits[0] = 0
+                enc_len = len(bits)
+
+                # Channel: mild ISI + AWGN
+                channel_output = _synthetic_pr_channel(
+                    bits, channel_target, snr,
+                    10000 + trial * 100,
+                )
+
+                # Desired signal: EPR4-shaped target from clean bits
+                bits_bipolar = make_bipolar(bits)
+                desired = _causal_fir(bits_bipolar, pri)
+
+                # LMS adaptive equalizer (plain LMS, supervised)
+                eq_coeff = np.zeros(NUM_EQ_TAPS)
+                mse, _ = adapt_equalizer(
+                    channel_output, desired, eq_coeff, NUM_EQ_TAPS,
+                    sector_len, pri, len(pri),
+                    start_flag=True, use_nlms=False,
+                )
+
+                # Equalize and detect
+                eq_out = apply_equalizer(channel_output, eq_coeff, NUM_EQ_TAPS)
+                eq_vit = eq_out.copy()
+                det, _ = classical_viterbi(delay, eq_vit, enc_len, pri)
+
+                errs = int(np.sum(det[:enc_len] != bits))
+                total_errors += errs
+                total_bits += enc_len
+                total_mse += mse
+
+            ber = total_errors / total_bits if total_bits > 0 else 1.0
             ber_points.append(ber)
-            print(f"    {ch_type}/{enc_name}: SNR={snr}dB BER={ber:.2e}")
-        ax.semilogy(snr_range, ber_points, "o-", label=label,
-                    linewidth=2, markersize=6)
-        all_ber[label] = ber_points
+            mse_points.append(total_mse / num_trials)
+            print(f"  {label}: SNR={snr}dB BER={ber:.2e} (MSE={mse_points[-1]:.1f}) ({total_errors}/{total_bits})")
 
-    axes[0].set_xlabel("SNR (dB)")
-    axes[0].set_ylabel("Bit Error Rate (BER)")
-    axes[0].set_title("BER vs SNR - Viterbi Detector")
-    axes[0].legend()
-    axes[0].grid(True, which="both", alpha=0.3)
+        axes_b[0].semilogy(snr_range_b, ber_points, "o-",
+                           label=label, linewidth=2, markersize=6)
+        all_ber_b[label] = ber_points
+        all_mse_b[label] = mse_points
 
-    # SER curve
-    for idx, (ch_type, enc_name, use_enc, enc_fn) in enumerate(configs):
-        label = f"{ch_type} {'(' + enc_name + ')' if enc_name != 'None' else ''}"
-        gpr_target, eq_coeff = gpr_cache[(ch_type, enc_fn)]
-        ser_points = []
-        for snr in snr_range:
-            _, ser, _ = run_single_sector_sweep(
-                ch_type, enc_fn, sector_len, snr, num_sectors,
-                eq_coeff_init=eq_coeff, gpr_target_init=gpr_target)
-            ser_points.append(ser)
-        axes[1].semilogy(snr_range, ser_points, "s-", label=label,
-                         linewidth=2, markersize=6)
-        all_ser[label] = ser_points
+    axes_b[0].set_xlabel("SNR (dB)")
+    axes_b[0].set_ylabel("Bit Error Rate (BER)")
+    axes_b[0].set_title("Phase B: Mild-ISI Channel + LMS Equalizer - BER")
+    axes_b[0].legend()
+    axes_b[0].grid(True, which="both", alpha=0.3)
 
-    axes[1].set_xlabel("SNR (dB)")
-    axes[1].set_ylabel("Block Error Rate (SER)")
-    axes[1].set_title("SER vs SNR - Viterbi Detector")
-    axes[1].legend()
-    axes[1].grid(True, which="both", alpha=0.3)
+    # MSE curve
+    for label in all_mse_b:
+        axes_b[1].semilogy(snr_range_b, all_mse_b[label], "s-",
+                           label=label, linewidth=2, markersize=6)
 
-    # Save GPR target and equalizer coefficients as text
-    for (ch_type, enc_fn), (gpr_target, eq_coeff) in gpr_cache.items():
-        enc_label = "NoEncoding" if enc_fn is None else enc_fn.__name__.replace("_", "-")
-        with open(RESULTS / f"exp5_gpr_target_{enc_label}.txt", "w") as f:
-            f.write(f"# GPR Target - Channel: {ch_type}, Encoding: {enc_label}\n")
-            f.write(f"# Length: {len(gpr_target)}\n")
-            f.write(" ".join(f"{v:.10f}" for v in gpr_target) + "\n")
-        with open(RESULTS / f"exp5_eq_coeff_{enc_label}.txt", "w") as f:
-            f.write(f"# Equalizer Coefficients - Channel: {ch_type}, Encoding: {enc_label}\n")
-            f.write(f"# Num taps: {len(eq_coeff)}\n")
-            for i, v in enumerate(eq_coeff):
-                f.write(f"{i:>3d}: {v:.10f}\n")
-        print(f"  Saved exp5_gpr_target_{enc_label}.txt, exp5_eq_coeff_{enc_label}.txt")
+    axes_b[1].set_xlabel("SNR (dB)")
+    axes_b[1].set_ylabel("Average MSE")
+    axes_b[1].set_title("Phase B: LMS Equalizer MSE vs SNR")
+    axes_b[1].legend()
+    axes_b[1].grid(True, which="both", alpha=0.3)
 
-    save_fig("exp5_ber_snr_viterbi.png")
-    print(f"  Done in {time.time()-t:.2f}s")
-    return {"ber_points": all_ber, "ser_points": all_ser}
+    save_fig("exp5_phase_b_channel_ber.png", dpi=200)
+    print(f"  Phase B done in {time.time() - phase_b_t:.2f}s")
+
+    with open(RESULTS / "exp5_phase_b_results.json", "w") as f:
+        json.dump({
+            "ber": all_ber_b,
+            "mse": all_mse_b,
+            "channel_target": channel_target.tolist(),
+        }, f, indent=2)
+    print(f"  Saved exp5_phase_b_results.json")
+
+    print(f"\n  Total exp5 time: {time.time() - t:.2f}s")
+    return {"phase_a": ber_results_a, "phase_b": {"ber": all_ber_b, "mse": all_mse_b}}
 
 
 # ===========================================================================
