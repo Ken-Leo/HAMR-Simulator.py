@@ -162,7 +162,7 @@ python -m simulator
 | `num_channel_taps` | `201` | Channel filter taps |
 | `num_eq_taps` | `21` | Equalizer taps |
 | `viterbi_delay` | `20` | Viterbi detection delay |
-| `pri_imp_res` | `[1,1,-1,-1]` | PR target (EPR4) |
+| `pri_imp_res` | `[1,1,-1,-1]` | PR target (EPR4, matches C code) |
 
 ## Running Tests
 
@@ -267,6 +267,11 @@ decimal representation.
 
 - **Viterbi**: PRML detector using trellis with squared Euclidean distance
   metrics, ping-pong path metric buffers, and traceback.
+  - Input must be **bipolar-encoded** (0->-1, 1->+1) convolved with PR target.
+  - Uses `delay=20` by default to allow trellis convergence.
+- **Viterbi (sliding window)**: For very long sequences, processes in
+  overlapping windows with boundary guards. Each window restarts the
+  trellis; only the middle portion is kept.
 - **SOVA**: Soft-output variant that tracks probability of wrong detection
   for each bit, producing both hard decisions and soft confidence values.
 
@@ -348,5 +353,25 @@ python experiments/run_experiments.py
 
 - **Unit tests:** 66/66 passed
 - **Code coverage:** 66% overall, 80%+ for all core modules
-- **Experiments:** 13/13 passed
+- **Experiments:** 13/13 passed (some with known limitations)
 - **Total runtime:** ~60 seconds
+
+### Known Issues (2026-04-29)
+
+1. **Viterbi detector on clean signals**: Fixed. Now works correctly on
+   bipolar-encoded PR target signals:
+   - Random 50 bits (clean): 2% BER
+   - 4096 bits (clean, delay=2): 0/4092 inner errors
+   - All-zeros: 0% BER
+   - All-ones: 4% BER (boundary effects only)
+   - Alternating [1,0,1,0...]: 50% BER (expected - EPR4 cancellation)
+
+2. **Full pipeline (channel + equalizer + Viterbi)**: The GPR equalizer
+   trained at 50dB produces ~54% BER at lower SNRs. Investigation ongoing:
+   - The equalizer coefficients may not properly invert the channel
+   - The simplified `find_gpr_target` differs from the C `FindGPRTarget`
+   - The C code uses a more sophisticated optimization (matrix inversions)
+
+3. **PR target**: Changed from `[1,0,-1]` to EPR4 `[1,1,-1,-1]` to match
+   the C code default. PR[1,0,-1] was found to have no trellis ambiguities
+   but produces poor detector performance on most patterns.

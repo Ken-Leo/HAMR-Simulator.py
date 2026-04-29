@@ -10,6 +10,7 @@ import numpy as np
 
 LMS_STEP_SIZE: float = 0.005
 MIN_MSE: float = 0.005
+NLMS_EPSILON: float = 1e-6
 
 
 def non_causal_fir(
@@ -284,13 +285,13 @@ def find_gpr_target(
     """
     data_length = len(eq_output)
 
-    # Energy of PR target (for normalisation)
-    # For EPR4: [1, 1, -1, -1], energy = 4
-    # We use a default GPR target shape
-    if gpr_target_length == 4:
-        gpr_target = np.array([1.0, 1.0, 0.0, -1.0, -1.0], dtype=np.float64)
+    # Default GPR target shapes matching common PR responses
+    if gpr_target_length == 3:
+        gpr_target = np.array([1.0, 0.0, -1.0], dtype=np.float64)
+    elif gpr_target_length == 4:
+        gpr_target = np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float64)  # EPR4
     elif gpr_target_length == 5:
-        gpr_target = np.array([1.0, 1.0, 0.0, -1.0, -1.0], dtype=np.float64)
+        gpr_target = np.array([1.0, 1.0, 0.0, -1.0, -1.0], dtype=np.float64)  # PR10
     else:
         gpr_target = np.zeros(gpr_target_length, dtype=np.float64)
         gpr_target[0] = 1.0

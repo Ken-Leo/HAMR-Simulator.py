@@ -54,7 +54,10 @@ SECTOR_TMTR = 361
 # Small sector lengths for fast iteration in BER experiments
 SECTOR_FAST = 101
 
-PRI_IMP = np.array([1, 1, -1, -1], dtype=np.float64)
+# 512-byte sector (4096 bits), adjusted to 4Z+1 for RLL(4/5) constraint
+SECTOR_512B = 4097  # 4×1024+1, ≈512 bytes
+
+PRI_IMP = np.array([1, 1, -1, -1], dtype=np.float64)  # EPR4 (matches C code)
 NUM_EQ_TAPS = 21
 
 
@@ -70,29 +73,51 @@ def make_bipolar(bits: np.ndarray) -> np.ndarray:
     return 2.0 * bits.astype(np.float64) - 1.0
 
 
+def _causal_fir_simple(data: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """Causal FIR filter producing len(data) output samples (PR target shaping)."""
+    pad_len = len(h) - 1
+    total_length = len(data) + 2 * pad_len
+    padded = np.zeros(total_length, dtype=np.float64)
+    padded[pad_len: pad_len + len(data)] = data[: len(data)]
+
+    output = np.zeros(len(data), dtype=np.float64)
+    for i in range(pad_len, len(data) + pad_len):
+        channel_output = 0.0
+        for j in range(len(h)):
+            channel_output += h[j] * padded[i - j]
+        output[i - pad_len] = channel_output
+
+    return output
+
+
 def run_single_sector_sweep(
     ch_type: str,
     encoder_fn,
     sector_len: int,
     snr_db: float,
     num_sectors: int = 100,
-) -> tuple[float, float]:
-    """Run one SNR point, return (ber, ser).
+    eq_coeff_init: np.ndarray | None = None,
+    gpr_target_init: np.ndarray | None = None,
+) -> tuple[float, float, dict]:
+    """Run one SNR point, return (ber, ser, info_dict).
 
-    Matches the C code pipeline:
-    1. Encode user bits
-    2. Pad with PREAMBLE_LENGTH pre + POSTAMBLE_LENGTH post (matching C)
-    3. Channel -> LPF -> Downsample from PRE*OSR
-    4. Viterbi detection
-    5. Decode and compare to original user bits
+    Full pipeline matches C GPRTarget mode:
+    1. One-time GPR target computation (done externally)
+    2. Fixed FIR equalizer (no per-sector LMS)
+    3. GPR target passed to Viterbi detector
     """
     PRE = 20  # preamble length (matches C PREAMBLE_LENGTH)
+    OSR = 10
     lcg_bits = uniform_random(-500)
     lcg_noise = uniform_random(-600)
-    noise_sigma = math.sqrt(10) * 10 ** (-snr_db / 20) * 2 * math.sqrt(2.5 / 2)
+    noise_sigma = math.sqrt(OSR) * 10 ** (-snr_db / 20) * 2 * math.sqrt(2.5 / 2)
     total_errors = 0
     total_bits = 0
     error_sectors = 0
+
+    # Use provided GPR target/coeffs, or fall back to PR target
+    gpr_target = gpr_target_init if gpr_target_init is not None else PRI_IMP
+    eq_coeff = eq_coeff_init if eq_coeff_init is not None else np.zeros(NUM_EQ_TAPS)
 
     for s in range(num_sectors):
         bits = np.array(
@@ -108,41 +133,129 @@ def run_single_sector_sweep(
             encoded = bits[:sector_len].copy()
 
         encoded_len = len(encoded)
+        oss_len = (PRE + encoded_len + PRE) * OSR
 
-        # Pad with pre/post padding (matches C code: PadSector with PREAMBLE/POSTAMBLE)
+        # Pad with pre/post padding (matches C code)
         padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
         padded[PRE: PRE + encoded_len] = encoded
         bipolar = make_bipolar(padded)
 
-        # Channel + noise
-        # Channel output length = len(bipolar) = (PRE + encoded_len + PRE)
-        # (C code truncates FIR output to input length)
-        ch_out = channel(bipolar, ch_type, 2.5, 201, 10, 0.0, 0.0, {}, s)
+        # Channel
+        ch_out = channel(bipolar, ch_type, 2.5, 201, OSR, 0.0, 0.0, {}, s)
 
-        noise = np.array([gaussian_random(lcg_noise) for _ in range(len(ch_out))],
+        # Add noise to inner region only (matches C)
+        noise = np.array([gaussian_random(lcg_noise) for _ in range(oss_len)],
                          dtype=np.float64)
-        ch_out += noise * noise_sigma
+        inner_start = PRE * OSR
+        inner_stop = oss_len - PRE * OSR
+        ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
 
-        # LPF + downsample
-        # LPF extends by filter_order//2 = 10 at the front
-        lpf_out = lpf(ch_out, 20, 0.1)
+        # LPF: C code calls LPF(ChannelOutput, OSSectorLength, ...)
+        ch_for_lpf = ch_out[:oss_len]
+        lpf_out = lpf(ch_for_lpf, 20, 1.0 / OSR)
 
-        # Downsample: start from PRE * OSR + LPF_front_extension
-        # C code: Downsample[PRE * OSR .. PRE * OSR + (SectorLength+PADDING) * OSR : OSR]
-        ds_start = PRE * 10 + 10  # 210 (200 + 10 LPF front extension)
-        ds = lpf_out[ds_start: ds_start + encoded_len * 10: 10]
+        # Downsample: C code does DSOutput[i] = LPFOutput[i * OSR]
+        ds = lpf_out[::OSR][:PRE + encoded_len + PRE]
 
-        # Extract data region (skip pre-padding in downsampled domain)
-        # Pre-padding in bits = PRE, in samples = PRE * OSR, in downsampled = PRE
-        # But since we already started from PRE*OSR, ds[0] = sample at PRE
-        # So the data starts at ds[0] directly, no further skip needed
-        eq_out = ds[:encoded_len]
+        # Apply fixed GPR equalizer (no per-sector LMS - matches C GPRTarget mode)
+        eq_out = apply_equalizer(ds[PRE: PRE + encoded_len], eq_coeff, NUM_EQ_TAPS)
 
-        # Viterbi detection
-        detected, _ = classical_viterbi(10, eq_out, encoded_len, PRI_IMP)
+        # Viterbi detection with GPR target
+        detected, _ = classical_viterbi(20, eq_out, encoded_len, gpr_target)
 
         # Decode if needed
         if encoder_fn is not None:
+            decoder_fn, _ = _get_decoder_for_encoder(encoder_fn)
+            decoded, _ = decoder_fn(detected, 0, encoded_len)
+            compare = min(len(decoded), sector_len)
+            errors = int(np.sum(decoded[:compare] != bits[:compare]))
+        else:
+            compare = encoded_len
+            errors = int(np.sum(detected[:compare] != bits[:compare]))
+
+        total_errors += errors
+        total_bits += compare
+        if errors > 0:
+            error_sectors += 1
+
+    ber = total_errors / total_bits if total_bits > 0 else 1.0
+    ser = error_sectors / num_sectors if num_sectors > 0 else 1.0
+    return ber, ser, {
+        "total_errors": total_errors,
+        "total_bits": total_bits,
+        "error_sectors": error_sectors,
+    }
+
+
+def run_single_sector_sweep_with_gpr(
+    ch_type: str,
+    encoder_fn,
+    sector_len: int,
+    snr_db: float,
+    num_sectors: int = 100,
+    eq_coeff_init: np.ndarray | None = None,
+    gpr_target_init: np.ndarray | None = None,
+    decoder_fn=None,
+) -> tuple[float, float, dict]:
+    """Run one SNR point with custom decoder, return (ber, ser, info_dict).
+
+    Extended version of run_single_sector_sweep that accepts a custom decoder
+    function for experiments with multiple encoder types.
+    """
+    PRE = 20
+    OSR = 10
+    lcg_bits = uniform_random(-500)
+    lcg_noise = uniform_random(-600)
+    noise_sigma = math.sqrt(OSR) * 10 ** (-snr_db / 20) * 2 * math.sqrt(2.5 / 2)
+    total_errors = 0
+    total_bits = 0
+    error_sectors = 0
+
+    gpr_target = gpr_target_init if gpr_target_init is not None else PRI_IMP
+    eq_coeff = eq_coeff_init if eq_coeff_init is not None else np.zeros(NUM_EQ_TAPS)
+
+    for s in range(num_sectors):
+        bits = np.array(
+            [int(lcg_bits.random() > 0.5) for _ in range(sector_len)],
+            dtype=np.int64,
+        )
+        bits[0] = 0
+
+        if encoder_fn is not None:
+            encoded = encoder_fn(bits, sector_len)
+        else:
+            encoded = bits[:sector_len].copy()
+
+        encoded_len = len(encoded)
+        oss_len = (PRE + encoded_len + PRE) * OSR
+
+        padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
+        padded[PRE: PRE + encoded_len] = encoded
+        bipolar = make_bipolar(padded)
+
+        ch_out = channel(bipolar, ch_type, 2.5, 201, OSR, 0.0, 0.0, {}, s)
+
+        noise = np.array([gaussian_random(lcg_noise) for _ in range(oss_len)],
+                         dtype=np.float64)
+        inner_start = PRE * OSR
+        inner_stop = oss_len - PRE * OSR
+        ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
+
+        ch_for_lpf = ch_out[:oss_len]
+        lpf_out = lpf(ch_for_lpf, 20, 1.0 / OSR)
+
+        ds = lpf_out[::OSR][:PRE + encoded_len + PRE]
+
+        eq_out = apply_equalizer(ds[PRE: PRE + encoded_len], eq_coeff, NUM_EQ_TAPS)
+
+        detected, _ = classical_viterbi(20, eq_out, encoded_len, gpr_target)
+
+        if decoder_fn is not None:
+            decoded, _ = decoder_fn(detected, 0, encoded_len)
+            compare = min(len(decoded), sector_len)
+            errors = int(np.sum(decoded[:compare] != bits[:compare]))
+        elif encoder_fn is not None:
+            # Fallback: use default RLL decoder
             decoded, _ = dec_4by5rll_code(detected, 0, encoded_len)
             compare = min(len(decoded), sector_len)
             errors = int(np.sum(decoded[:compare] != bits[:compare]))
@@ -157,7 +270,78 @@ def run_single_sector_sweep(
 
     ber = total_errors / total_bits if total_bits > 0 else 1.0
     ser = error_sectors / num_sectors if num_sectors > 0 else 1.0
-    return ber, ser
+    return ber, ser, {
+        "total_errors": total_errors,
+        "total_bits": total_bits,
+        "error_sectors": error_sectors,
+    }
+
+
+def compute_gpr_target_for_sweep(
+    ch_type: str,
+    encoder_fn,
+    sector_len: int,
+    num_eq_sectors: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute GPR target and equalizer coefficients from training sectors.
+
+    Matches C FindGPRTarget() usage in GPRTarget mode.
+    Returns (gpr_target, eq_coeff).
+    """
+    PRE = 20
+    OSR = 10
+    lcg_bits = uniform_random(-500)
+    lcg_noise = uniform_random(-600)
+    adapt_snr = 50.0
+    nd = 2.5
+    noise_sigma = math.sqrt(OSR) * 10 ** (-adapt_snr / 20) * 2 * math.sqrt(nd / 2)
+
+    concat_input: list[np.ndarray] = []
+    concat_output: list[np.ndarray] = []
+
+    for s in range(num_eq_sectors):
+        bits = np.array(
+            [int(lcg_bits.random() > 0.5) for _ in range(sector_len)],
+            dtype=np.int64,
+        )
+        bits[0] = 0
+
+        if encoder_fn is not None:
+            bits[0] = 0
+            encoded = encoder_fn(bits, sector_len)
+        else:
+            encoded = bits[:sector_len].copy()
+
+        encoded_len = len(encoded)
+        oss_len = (PRE + encoded_len + PRE) * OSR
+
+        padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
+        padded[PRE: PRE + encoded_len] = encoded
+        bipolar = make_bipolar(padded)
+
+        ch_out = channel(bipolar, ch_type, 2.5, 201, OSR, 0.0, 0.0, {}, s)
+
+        noise = np.array([gaussian_random(lcg_noise) for _ in range(oss_len)],
+                         dtype=np.float64)
+        inner_start = PRE * OSR
+        inner_stop = oss_len - PRE * OSR
+        ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
+
+        ch_for_lpf = ch_out[:oss_len]
+        lpf_out = lpf(ch_for_lpf, 20, 1.0 / OSR)
+
+        ds = lpf_out[::OSR][:PRE + encoded_len + PRE]
+
+        concat_input.append(make_bipolar(encoded))
+        concat_output.append(ds[PRE: PRE + encoded_len])
+
+    full_input = np.concatenate(concat_input)
+    full_output = np.concatenate(concat_output)
+    gpr_target, eq_coeff = find_gpr_target(
+        full_output, full_input, NUM_EQ_TAPS,
+        gpr_target_length=4,  # EPR4 [1,1,-1,-1] (matches C code)
+    )
+    return gpr_target, eq_coeff
 
 
 # ===========================================================================
@@ -359,20 +543,25 @@ def exp4_rll_code():
     print("\n[EXP4] RLL(4/5) Code Analysis")
     t = time.time()
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Codeword display
+    # Codeword table as text
     ax = axes[0]
+    ax.axis("off")
     cw_bits = rll_cw.astype(int)  # shape (16, 5)
-    n_cw = len(rll_cw)
-    for i in range(n_cw):
-        ax.bar(i, cw_bits[i], width=0.8, color="steelblue", edgecolor="black")
-    ax.set_xlabel("Codeword Decimal (input value)")
-    ax.set_ylabel("Bit Value")
-    ax.set_xticks(range(n_cw))
-    ax.set_title(f"RLL(4/5) Codeword Table\n({n_cw} codewords, {cw_bits.shape[1]} bits each)")
-    ax.set_ylim(-0.1, 1.1)
-    ax.grid(True, alpha=0.3, axis="y")
+    lines = ["RLL(4/5) Codebook  (rate 4/5, RLL(0,2))",
+             " " + "-" * 38]
+    lines.append(f"{'Src':>4s}  |  {'Codeword':>5s}")
+    lines.append(f"{'----':>4s}  |  {'------':>5s}")
+    for i in range(16):
+        cw = cw_bits[i]
+        src = f"{i:04b}"
+        row = f"  {src}   |  {''.join(str(b) for b in cw)}"
+        lines.append(row)
+    ax.text(0.1, 0.95, "\n".join(lines), transform=ax.transAxes,
+            fontsize=11, verticalalignment="top", family="monospace",
+            bbox=dict(boxstyle="round", facecolor="#e8f4e8", alpha=0.8))
+    ax.set_title("RLL(4/5) Codeword Table")
 
     # Transition density comparison
     ax = axes[1]
@@ -384,39 +573,18 @@ def exp4_rll_code():
         bits = np.random.randint(0, 2, SECTOR_RLL, dtype=np.int64)
         bits[0] = 0
         encoded = enc_4by5rll_code(bits, SECTOR_RLL)
-        nt = len(encoded)
         user_t = np.sum(np.abs(np.diff(bits))) / max(len(bits) - 1, 1)
-        enc_t = np.sum(np.abs(np.diff(encoded))) / max(nt - 1, 1)
+        enc_t = np.sum(np.abs(np.diff(encoded))) / max(len(encoded) - 1, 1)
         user_trans.append(user_t)
         enc_trans.append(enc_t)
 
-    ax.hist(user_trans, bins=30, alpha=0.5, label="User bits", density=True)
-    ax.hist(enc_trans, bins=30, alpha=0.5, label="Encoded bits", density=True)
-    ax.set_xlabel("Transition Density")
-    ax.set_ylabel("Density")
-    ax.set_title("Transition Density: User vs RLL(4/5) Encoded")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # Sample encoded sequence
-    ax = axes[2]
-    bits = np.random.randint(0, 2, 21, dtype=np.int64)
-    bits[0] = 0
-    encoded = enc_4by5rll_code(bits, 21)
-    # Expand bits to match encoded length for display
-    scale = len(encoded) / len(bits)
-    x_pos = np.linspace(0, len(encoded) - 1, len(bits)).astype(int)
-    display_bits = np.zeros(len(encoded), dtype=int)
-    for i, pos in enumerate(x_pos):
-        display_bits[pos] = bits[i]
-
-    ax.imshow([display_bits[:len(encoded)], encoded], aspect="auto",
-              cmap="Blues", interpolation="nearest")
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(["User bits (expanded)", "Encoded"])
-    ax.set_xlabel("Bit Position")
-    ax.set_title("Sample RLL(4/5) Encoding\n(0/1 -> NRZI -> NRZ)")
-    ax.grid(False)
+    user_trans, enc_trans = np.array(user_trans), np.array(enc_trans)
+    ax.bar(["User bits", "RLL(4/5) encoded"],
+           [user_trans.mean(), enc_trans.mean()],
+           color=["steelblue", "coral"], yerr=[user_trans.std(), enc_trans.std()],
+           capsize=4, error_kw={"alpha": 0.5, "capsize": 4})
+    ax.set_ylabel("Transition Density")
+    ax.set_title(f"Transition Density\nRLL(4/5) increases transitions by {(enc_trans.mean()/user_trans.mean()-1)*100:.1f}%")
 
     save_fig("exp4_rll_code.png")
     print(f"  Done in {time.time()-t:.2f}s")
@@ -427,14 +595,29 @@ def exp4_rll_code():
 # Experiment 5: BER vs SNR - Viterbi Detector
 # ===========================================================================
 
+def _get_decoder_for_encoder(enc_fn):
+    """Return the matching decoder function and its codeword length."""
+    if enc_fn is None:
+        return None, 0
+    if enc_fn is enc_4by5rll_code:
+        return dec_4by5rll_code, 4
+    if enc_fn is enc_6by7mtr_code:
+        return dec_6by7mtr_code, 6
+    if enc_fn is enc_8by9tmtr_code:
+        return dec_8by9tmtr_code, 8
+    return dec_4by5rll_code, 4
+
+
 def exp5_ber_snr_viterbi():
     """Experiment 5: BER vs SNR curves for different channel/encoding
-    combinations using Viterbi detector."""
+    combinations using Viterbi detector with GPR fixed equalizer."""
     print("\n[EXP5] BER vs SNR (Viterbi)")
     t = time.time()
 
     snr_range = np.arange(24, 41, 2)  # 24, 26, ..., 40 dB
     num_sectors = 50
+    num_eq_sectors = 20
+    sector_len = SECTOR_512B  # 4097 bits (~512 bytes, 4Z+1 for RLL(4/5))
 
     configs = [
         ("Perpendicular", "No Encoding", False, None),
@@ -446,45 +629,72 @@ def exp5_ber_snr_viterbi():
     all_ber = {}
     all_ser = {}
 
+    # Pre-compute GPR target/coeffs for each config (one-time, matches C GPRTarget mode)
+    gpr_cache: dict = {}
+    for ch_type, enc_name, use_enc, enc_fn in configs:
+        key = (ch_type, enc_fn)
+        if key not in gpr_cache:
+            print(f"  Computing GPR target for {enc_name} ...")
+            gpr_target, eq_coeff = compute_gpr_target_for_sweep(
+                ch_type, enc_fn, sector_len, num_eq_sectors=num_eq_sectors)
+            gpr_cache[key] = (gpr_target, eq_coeff)
+
     for ax_idx, (ch_type, enc_name, use_enc, enc_fn) in enumerate(configs):
-        if ax_idx >= 2:
+        if ax_idx >= 1:
             continue
         ax = axes[ax_idx]
         label = f"{ch_type} {'(' + enc_name + ')' if enc_name != 'None' else ''}"
+        gpr_target, eq_coeff = gpr_cache[(ch_type, enc_fn)]
         ber_points = []
         for snr in snr_range:
-            ber, _ = run_single_sector_sweep(
-                ch_type, enc_fn, SECTOR_FAST, snr, num_sectors)
+            ber, _, _ = run_single_sector_sweep(
+                ch_type, enc_fn, sector_len, snr, num_sectors,
+                eq_coeff_init=eq_coeff, gpr_target_init=gpr_target)
             ber_points.append(ber)
             print(f"    {ch_type}/{enc_name}: SNR={snr}dB BER={ber:.2e}")
         ax.semilogy(snr_range, ber_points, "o-", label=label,
                     linewidth=2, markersize=6)
         all_ber[label] = ber_points
 
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("Bit Error Rate (BER)")
-    ax.set_title("BER vs SNR - Viterbi Detector")
-    ax.legend()
-    ax.grid(True, which="both", alpha=0.3)
+    axes[0].set_xlabel("SNR (dB)")
+    axes[0].set_ylabel("Bit Error Rate (BER)")
+    axes[0].set_title("BER vs SNR - Viterbi Detector")
+    axes[0].legend()
+    axes[0].grid(True, which="both", alpha=0.3)
 
     # SER curve
-    ax2 = axes[1]
     for idx, (ch_type, enc_name, use_enc, enc_fn) in enumerate(configs):
         label = f"{ch_type} {'(' + enc_name + ')' if enc_name != 'None' else ''}"
+        gpr_target, eq_coeff = gpr_cache[(ch_type, enc_fn)]
         ser_points = []
         for snr in snr_range:
-            _, ser = run_single_sector_sweep(
-                ch_type, enc_fn, SECTOR_FAST, snr, num_sectors)
+            _, ser, _ = run_single_sector_sweep(
+                ch_type, enc_fn, sector_len, snr, num_sectors,
+                eq_coeff_init=eq_coeff, gpr_target_init=gpr_target)
             ser_points.append(ser)
-        ax2.semilogy(snr_range, ser_points, "s-", label=label,
-                     linewidth=2, markersize=6)
+        axes[1].semilogy(snr_range, ser_points, "s-", label=label,
+                         linewidth=2, markersize=6)
         all_ser[label] = ser_points
 
-    ax2.set_xlabel("SNR (dB)")
-    ax2.set_ylabel("Block Error Rate (SER)")
-    ax2.set_title("SER vs SNR - Viterbi Detector")
-    ax2.legend()
-    ax2.grid(True, which="both", alpha=0.3)
+    axes[1].set_xlabel("SNR (dB)")
+    axes[1].set_ylabel("Block Error Rate (SER)")
+    axes[1].set_title("SER vs SNR - Viterbi Detector")
+    axes[1].legend()
+    axes[1].grid(True, which="both", alpha=0.3)
+
+    # Save GPR target and equalizer coefficients as text
+    for (ch_type, enc_fn), (gpr_target, eq_coeff) in gpr_cache.items():
+        enc_label = "NoEncoding" if enc_fn is None else enc_fn.__name__.replace("_", "-")
+        with open(RESULTS / f"exp5_gpr_target_{enc_label}.txt", "w") as f:
+            f.write(f"# GPR Target - Channel: {ch_type}, Encoding: {enc_label}\n")
+            f.write(f"# Length: {len(gpr_target)}\n")
+            f.write(" ".join(f"{v:.10f}" for v in gpr_target) + "\n")
+        with open(RESULTS / f"exp5_eq_coeff_{enc_label}.txt", "w") as f:
+            f.write(f"# Equalizer Coefficients - Channel: {ch_type}, Encoding: {enc_label}\n")
+            f.write(f"# Num taps: {len(eq_coeff)}\n")
+            for i, v in enumerate(eq_coeff):
+                f.write(f"{i:>3d}: {v:.10f}\n")
+        print(f"  Saved exp5_gpr_target_{enc_label}.txt, exp5_eq_coeff_{enc_label}.txt")
 
     save_fig("exp5_ber_snr_viterbi.png")
     print(f"  Done in {time.time()-t:.2f}s")
@@ -496,14 +706,24 @@ def exp5_ber_snr_viterbi():
 # ===========================================================================
 
 def exp6_sova_soft_output():
-    """Experiment 6: Analyze SOVA soft output quality at different SNR levels."""
+    """Experiment 6: Analyze SOVA soft output quality at different SNR levels.
+
+    Uses GPR fixed equalizer (one-time computation) matching C GPRTarget mode.
+    """
     print("\n[EXP6] SOVA Soft Output Analysis")
     t = time.time()
 
-    snr_values = [26, 29, 32, 35]
+    snr_values = [28, 31, 34, 37]
     sector_len = SECTOR_RLL
     PRE = 20
+    OSR = 10
     lcg_base = 0
+    num_eq_sectors = 20
+
+    # Pre-compute GPR target/coeffs (one-time, matches C GPRTarget mode)
+    print("  Computing GPR target for SOVA analysis ...")
+    gpr_target, eq_coeff = compute_gpr_target_for_sweep(
+        "Perpendicular", enc_4by5rll_code, sector_len, num_eq_sectors)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -512,39 +732,53 @@ def exp6_sova_soft_output():
         lcg_bits = uniform_random(-500 - lcg_base)
         lcg_noise = uniform_random(-600 - lcg_base)
         lcg_base += 100
-        noise_sigma = math.sqrt(10) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
+        noise_sigma = math.sqrt(OSR) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
 
         bits = np.array(
             [int(lcg_bits.random() > 0.5) for _ in range(sector_len)],
             dtype=np.int64,
         )
         bits[0] = 0
+        encoded = enc_4by5rll_code(bits, sector_len)
+        encoded_len = len(encoded)
 
         # Pre/post padding before channel
-        padded = np.zeros(PRE + sector_len + PRE, dtype=np.int64)
-        padded[PRE: PRE + sector_len] = bits
+        padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
+        padded[PRE: PRE + encoded_len] = encoded
         bipolar = make_bipolar(padded)
 
-        ch_out = channel(bipolar, "Perpendicular", 2.5, 201, 10, 0.0, 0.0, {}, 0)
-        noise = np.array([gaussian_random(lcg_noise) for _ in range(len(ch_out))],
+        oss_len = (PRE + encoded_len + PRE) * OSR
+        ch_out = channel(bipolar, "Perpendicular", 2.5, 201, OSR, 0.0, 0.0, {}, 0)
+
+        # Noise added to inner region only (matches C)
+        noise = np.array([gaussian_random(lcg_noise) for _ in range(oss_len)],
                          dtype=np.float64)
-        ch_out += noise * noise_sigma
-        lpf_out = lpf(ch_out, 20, 0.1)
+        inner_start = PRE * OSR
+        inner_stop = oss_len - PRE * OSR
+        ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
 
-        # Downsample from PRE*OSR + LPF_front_extension
-        ds_start = PRE * 10 + 10  # 210
-        ds = lpf_out[ds_start: ds_start + sector_len * 10: 10]
-        eq_out = ds[:sector_len]
+        # LPF: only first OSSectorLength samples
+        lpf_out = lpf(ch_out[:oss_len], 20, 1.0 / OSR)
 
-        hard, soft, _ = classical_sova(10, eq_out, sector_len, PRI_IMP, noise_sigma)
+        # Downsample: DSOutput[i] = LPFOutput[i * OSR]
+        ds = lpf_out[::OSR][:PRE + encoded_len + PRE]
 
-        errors = int(np.sum(hard[:sector_len] != bits[:sector_len]))
+        # Apply fixed GPR equalizer
+        eq_out = apply_equalizer(ds[PRE: PRE + encoded_len], eq_coeff, NUM_EQ_TAPS)
+
+        # SOVA detection with GPR target
+        hard, soft, _ = classical_sova(10, eq_out, encoded_len, gpr_target, noise_sigma)
+
+        # Decode
+        decoded, _ = dec_4by5rll_code(hard, 0, encoded_len)
+        compare = min(len(decoded), sector_len)
+        errors = int(np.sum(decoded[:compare] != bits[:compare]))
         mean_conf = float(np.mean(soft))
         std_conf = float(np.std(soft))
 
         # Plot soft outputs color-coded by correctness
-        correct = hard[:sector_len] == bits[:sector_len]
-        for i in range(sector_len):
+        correct = decoded[:compare] == bits[:compare]
+        for i in range(compare):
             color = "green" if correct[i] else "red"
             ax.scatter(i, soft[i], s=3, c=color, alpha=0.4)
 
@@ -565,7 +799,14 @@ def exp6_sova_soft_output():
 
 def exp7_equalizer_convergence():
     """Experiment 7: Track LMS adaptive equalizer MSE decrease over
-    iterations using real channel signals with proper timing alignment."""
+    iterations using real channel signals with proper timing alignment.
+
+    NOTE: This experiment specifically tests LMS convergence behavior.
+    It uses per-sector LMS adaptation (FixedPRTarget mode) to demonstrate
+    the MSE curve shape. The user should be aware that in the actual
+    GPRTarget mode used in production, a fixed GPR equalizer is used
+    instead of per-sector LMS.
+    """
     print("\n[EXP7] LMS Equalizer Convergence")
     t = time.time()
 
@@ -574,11 +815,19 @@ def exp7_equalizer_convergence():
     num_eq_taps = 21
     sector_len = SECTOR_RLL
     PRE = 20
+    OSR = 10
     num_iterations = 30
+    # Moderate SNR for LMS convergence demonstration
+    snr_demo = 30.0
+    noise_sigma = math.sqrt(OSR) * 10 ** (-snr_demo / 20) * 2 * math.sqrt(2.5 / 2)
 
     eq_coeff = np.zeros(num_eq_taps)
     mse_history = []
     lmse_history = []
+
+    # Save final iteration data for plots
+    final_ds_output = None
+    final_desired = None
 
     for iteration in range(num_iterations):
         start = 1 if iteration == 0 else 0
@@ -590,22 +839,29 @@ def exp7_equalizer_convergence():
         padded[PRE: PRE + sector_len] = bits
         bipolar = make_bipolar(padded)
 
-        ch_out = channel(bipolar, "Perpendicular", 2.5, 201, 10, 0.0, 0.0, {}, iteration)
-        lpf_out = lpf(ch_out, 20, 0.1)
+        oss_len = (PRE + sector_len + PRE) * OSR
+        ch_out = channel(bipolar, "Perpendicular", 2.5, 201, OSR, 0.0, 0.0, {}, iteration)
 
-        # Downsample from PRE*OSR + LPF_front_extension
-        ds_start = PRE * 10 + 10
-        ds_output = lpf_out[ds_start: ds_start + sector_len * 10: 10][:sector_len]
+        # Add noise to inner region only (matches C)
+        np.random.seed(42 + iteration)
+        noise = np.array([gaussian_random(uniform_random(-600 - iteration))
+                          for _ in range(oss_len)], dtype=np.float64)
+        inner_start = PRE * OSR
+        inner_stop = oss_len - PRE * OSR
+        ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
 
-        # Desired output = PR impulse response repeated/padded to sector_len
-        desired = np.zeros(sector_len)
-        pr_len = len(pri_imp_res)
-        # Place PR response centered in the sector (matches timing alignment)
-        center = sector_len // 2
-        for i in range(pr_len):
-            idx = center - pr_len // 2 + i
-            if 0 <= idx < sector_len:
-                desired[idx] = pri_imp_res[i]
+        # LPF: only first OSSectorLength samples
+        lpf_out = lpf(ch_out[:oss_len], 20, 1.0 / OSR)
+
+        # Downsample: DSOutput[i] = LPFOutput[i * OSR]
+        ds_full = lpf_out[::OSR][:PRE + sector_len + PRE]
+
+        # Extract inner region (strip pre/post padding)
+        ds_output = ds_full[PRE * OSR: PRE * OSR + sector_len * OSR: OSR][:sector_len]
+
+        # Desired output = PR-shaped signal from clean bits through PR FIR
+        bits_bipolar = make_bipolar(padded[PRE: PRE + sector_len])
+        desired = _causal_fir_simple(bits_bipolar, pri_imp_res)
 
         mse, avg_lmse = adapt_equalizer(
             ds_output, desired, eq_coeff, num_eq_taps,
@@ -614,6 +870,10 @@ def exp7_equalizer_convergence():
         )
         mse_history.append(mse)
         lmse_history.append(avg_lmse)
+
+        if iteration == num_iterations - 1:
+            final_ds_output = ds_output
+            final_desired = desired
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -637,20 +897,22 @@ def exp7_equalizer_convergence():
 
     # Equalizer Output vs Desired (final iteration)
     ax = axes[1, 0]
-    # Apply final equalizer coefficients to show alignment
-    applied = np.convolve(ds_output, eq_coeff, mode="same")
-    # Compensate for equalizer group delay: shift by (num_eq_taps-1)//2
-    delay = (num_eq_taps - 1) // 2
-    if delay > 0:
-        aligned_eq = np.zeros_like(applied)
-        aligned_eq[delay:] = applied[:-delay]
-        applied = aligned_eq
-    x = np.arange(len(applied))
-    ax.plot(x, applied, "b-", label="Equalizer Output", linewidth=1.5, alpha=0.7)
-    ax.plot(x, desired, "r--", label="Desired PR Response", linewidth=2)
+    if final_ds_output is not None:
+        applied = apply_equalizer(final_ds_output, eq_coeff, num_eq_taps)
+        # Apply delay compensation for visualization
+        eq_delay = (num_eq_taps - 1) // 2  # 10
+        pr_delay = len(pri_imp_res) // 2   # 2
+        shift = eq_delay - pr_delay        # 8
+        if shift > 0 and shift < len(applied):
+            aligned_eq = np.zeros_like(applied)
+            aligned_eq[:len(applied) - shift] = applied[shift:]
+            applied = aligned_eq
+        x = np.arange(len(applied))
+        ax.plot(x, applied, "b-", label="Equalizer Output", linewidth=1.5, alpha=0.7)
+        ax.plot(x, final_desired, "r--", label="Desired PR Response", linewidth=2)
+        ax.set_title("Equalizer Output vs Desired PR (delay-compensated)")
     ax.set_xlabel("Sample Index")
     ax.set_ylabel("Amplitude")
-    ax.set_title("Equalizer Output vs Desired PR (delay-compensated)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -902,12 +1164,23 @@ def exp10_rng_analysis():
 # ===========================================================================
 
 def exp11_detector_comparison():
-    """Experiment 11: Compare Viterbi and SOVA performance."""
+    """Experiment 11: Compare Viterbi and SOVA performance with GPR fixed
+    equalizer matching C GPRTarget mode."""
     print("\n[EXP11] Viterbi vs SOVA Comparison")
     t = time.time()
 
     snr_range = np.arange(24, 41, 2)  # 24-40 dB
     sector_len = SECTOR_RLL  # 101 bits (4Z+1)
+    PRE = 20
+    OSR = 10
+    num_trials = 50
+    num_eq_sectors = 20
+
+    # Pre-compute GPR target/coeffs (one-time)
+    print("  Computing GPR target for Exp11 ...")
+    gpr_target, eq_coeff = compute_gpr_target_for_sweep(
+        "Perpendicular", enc_4by5rll_code, sector_len, num_eq_sectors)
+
     viterbi_ber = []
     sova_ber = []
     sova_conf = []
@@ -917,51 +1190,59 @@ def exp11_detector_comparison():
         s_errors = 0
         total_bits = 0
         conf_sum = 0.0
-        num_trials = 50  # Increased for reliable BER statistics
+        noise_sigma = math.sqrt(OSR) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
 
-        lcg_v = uniform_random(-500)
-        lcg_s = uniform_random(-500)
-        lcg_n = uniform_random(-600)
-        noise_sigma = math.sqrt(10) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
+        for trial in range(num_trials):
+            lcg_v = uniform_random(-500 - trial)
+            lcg_s = uniform_random(-501 - trial)
+            lcg_n = uniform_random(-600 - trial)
 
-        for _ in range(num_trials):
             bits = np.array(
                 [int(lcg_v.random() > 0.5) for _ in range(sector_len)],
                 dtype=np.int64,
             )
             bits[0] = 0
+            encoded = enc_4by5rll_code(bits, sector_len)
+            encoded_len = len(encoded)
 
-            # Pre/post padding before channel (matches C code pipeline)
-            PRE = 20
-            padded = np.zeros(PRE + sector_len + PRE, dtype=np.int64)
-            padded[PRE: PRE + sector_len] = bits
+            # Pre/post padding before channel (matches C code)
+            padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
+            padded[PRE: PRE + encoded_len] = encoded
             bipolar = make_bipolar(padded)
 
-            ch_out = channel(bipolar, "Perpendicular", 2.5, 201, 10, 0.0, 0.0, {}, 0)
-            noise = np.array([gaussian_random(lcg_n) for _ in range(len(ch_out))],
-                             dtype=np.float64)
-            ch_out += noise * noise_sigma
-            lpf_out = lpf(ch_out, 20, 0.1)
+            oss_len = (PRE + encoded_len + PRE) * OSR
+            ch_out = channel(bipolar, "Perpendicular", 2.5, 201, OSR, 0.0, 0.0, {}, trial)
 
-            # Downsample from PRE*OSR + LPF_front_extension
-            ds_start = PRE * 10 + 10  # 210
-            ds = lpf_out[ds_start: ds_start + sector_len * 10: 10]
-            eq_out = ds[:sector_len]
+            # Noise added to inner region only
+            noise = np.array([gaussian_random(lcg_n) for _ in range(oss_len)],
+                             dtype=np.float64)
+            inner_start = PRE * OSR
+            inner_stop = oss_len - PRE * OSR
+            ch_out[inner_start: inner_stop] += noise[inner_start: inner_stop] * noise_sigma
+
+            # LPF: only first OSSectorLength samples
+            lpf_out = lpf(ch_out[:oss_len], 20, 1.0 / OSR)
+
+            # Downsample: DSOutput[i] = LPFOutput[i * OSR]
+            ds = lpf_out[::OSR][:PRE + encoded_len + PRE]
+
+            # Apply fixed GPR equalizer
+            eq_out = apply_equalizer(ds[PRE: PRE + encoded_len], eq_coeff, NUM_EQ_TAPS)
 
             # Viterbi
-            v_hard, _ = classical_viterbi(10, eq_out, sector_len, PRI_IMP)
-            v_errors += int(np.sum(v_hard[:sector_len] != bits[:sector_len]))
+            v_hard, _ = classical_viterbi(PRE, eq_out, encoded_len, gpr_target)
+            v_errors += int(np.sum(v_hard[:encoded_len] != bits[:encoded_len]))
 
-            # SOVA
+            # SOVA (use same equalized output)
             s_hard, s_soft, _ = classical_sova(
-                10, eq_out, sector_len, PRI_IMP, noise_sigma)
-            s_errors += int(np.sum(s_hard[:sector_len] != bits[:sector_len]))
+                PRE, eq_out, encoded_len, gpr_target, noise_sigma)
+            s_errors += int(np.sum(s_hard[:encoded_len] != bits[:encoded_len]))
             conf_sum += float(np.mean(s_soft))
-            total_bits += sector_len
+            total_bits += encoded_len
 
         viterbi_ber.append(v_errors / total_bits)
         sova_ber.append(s_errors / total_bits)
-        sova_conf.append(conf_sum / (num_trials * sector_len))
+        sova_conf.append(conf_sum / max(total_bits, 1))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -995,12 +1276,11 @@ def exp11_detector_comparison():
 
 def exp12_full_pipeline():
     """Experiment 12: End-to-end pipeline with different encoder types
-    at fixed SNR."""
+    at fixed SNR, using GPR fixed equalizer (C GPRTarget mode)."""
     print("\n[EXP12] Full Pipeline Comparison")
     t = time.time()
 
-    snr = 28
-    pri_imp_res = np.array([1, 1, -1, -1], dtype=np.float64)
+    snr = 30
     configs = [
         ("No Encoding", None, None, SECTOR_RLL),
         ("RLL(4/5)", enc_4by5rll_code, dec_4by5rll_code, SECTOR_RLL),
@@ -1009,9 +1289,16 @@ def exp12_full_pipeline():
     ]
     ch_type = "Perpendicular"
     num_sectors = 100
-    PRE = 20
+    num_eq_sectors = 20
 
-    lcg_base = 0
+    # Pre-compute GPR target/coeffs for each config
+    gpr_cache: dict = {}
+    for enc_name, enc_fn, dec_fn, sector_len in configs:
+        print(f"  Computing GPR target for {enc_name} ...")
+        gpr_target, eq_coeff = compute_gpr_target_for_sweep(
+            ch_type, enc_fn, sector_len, num_eq_sectors=num_eq_sectors)
+        gpr_cache[(enc_fn, sector_len)] = (gpr_target, eq_coeff)
+
     labels = []
     bers = []
     sers = []
@@ -1019,65 +1306,14 @@ def exp12_full_pipeline():
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for enc_name, enc_fn, dec_fn, sector_len in configs:
-        lcg_bits = uniform_random(-500 - lcg_base)
-        lcg_noise = uniform_random(-600 - lcg_base)
-        lcg_base += 100
-        noise_sigma = math.sqrt(10) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
+        gpr_target, eq_coeff = gpr_cache[(enc_fn, sector_len)]
+        decoder_fn, _ = _get_decoder_for_encoder(dec_fn) if dec_fn else (None, 0)
 
-        total_errors = 0
-        total_bits = 0
-        error_sectors = 0
+        ber, ser, info = run_single_sector_sweep_with_gpr(
+            ch_type, enc_fn, sector_len, snr, num_sectors,
+            eq_coeff_init=eq_coeff, gpr_target_init=gpr_target,
+            decoder_fn=decoder_fn)
 
-        for s in range(num_sectors):
-            bits = np.array(
-                [int(lcg_bits.random() > 0.5) for _ in range(sector_len)],
-                dtype=np.int64,
-            )
-            bits[0] = 0
-
-            if enc_fn is not None:
-                bits[0] = 0
-                encoded = enc_fn(bits, sector_len)
-            else:
-                encoded = bits[:sector_len].copy()
-
-            encoded_len = len(encoded)
-
-            # Pre/post padding before channel (matches C code)
-            padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
-            padded[PRE: PRE + encoded_len] = encoded
-            bipolar = make_bipolar(padded)
-
-            ch_out = channel(bipolar, ch_type, 2.5, 201, 10, 0.0, 0.0, {}, s)
-            noise = np.array([gaussian_random(lcg_noise) for _ in range(len(ch_out))],
-                             dtype=np.float64)
-            ch_out += noise * noise_sigma
-            lpf_out = lpf(ch_out, 20, 0.1)
-
-            # Downsample from PRE*OSR + LPF_front_extension
-            ds_start = PRE * 10 + 10  # 210
-            ds = lpf_out[ds_start: ds_start + encoded_len * 10: 10]
-            eq_out = ds[:encoded_len]
-
-            v_hard, _ = classical_viterbi(10, eq_out, encoded_len, pri_imp_res)
-
-            if dec_fn is not None:
-                # MTR decoder returns 1 value, RLL/TMTR return 2
-                result = dec_fn(v_hard, 0, encoded_len)
-                decoded = result if isinstance(result, np.ndarray) else result[0]
-                compare = min(len(decoded), sector_len)
-                errors = int(np.sum(decoded[:compare] != bits[:compare]))
-            else:
-                compare = sector_len
-                errors = int(np.sum(v_hard[:compare] != bits[:compare]))
-
-            total_errors += errors
-            total_bits += compare
-            if errors > 0:
-                error_sectors += 1
-
-        ber = total_errors / total_bits if total_bits > 0 else 1.0
-        ser = error_sectors / num_sectors
         labels.append(enc_name)
         bers.append(ber)
         sers.append(ser)
@@ -1105,72 +1341,49 @@ def exp12_full_pipeline():
 # ===========================================================================
 
 def exp13_all_codes_roundtrip():
-    """Experiment 13: Round-trip BER analysis for all three code types."""
+    """Experiment 13: Round-trip BER analysis for all three code types
+    with GPR fixed equalizer."""
     print("\n[EXP13] All Codes Round-Trip BER")
     t = time.time()
 
-    snr_range = np.arange(24, 38, 2)  # 24-36 dB
-    PRE = 20
+    snr_range = np.arange(26, 40, 2)  # 26-38 dB
     codes = [
         ("RLL(4/5)", enc_4by5rll_code, dec_4by5rll_code, SECTOR_RLL),
         ("MTR(6/7)", enc_6by7mtr_code, dec_6by7mtr_code, SECTOR_MTR),
         ("TMTR(8/9)", enc_8by9tmtr_code, dec_8by9tmtr_code, SECTOR_TMTR),
     ]
+    num_eq_sectors = 20
+
+    # Pre-compute GPR target/coeffs for each code
+    gpr_cache: dict = {}
+    for name, enc_fn, dec_fn, sector_len in codes:
+        print(f"  Computing GPR target for {name} ...")
+        gpr_target, eq_coeff = compute_gpr_target_for_sweep(
+            "Perpendicular", enc_fn, sector_len, num_eq_sectors=num_eq_sectors)
+        gpr_cache[(enc_fn, sector_len)] = (gpr_target, eq_coeff)
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
     colors = ["blue", "green", "red"]
     for (name, enc_fn, dec_fn, sector_len), color in zip(codes, colors):
+        gpr_target, eq_coeff = gpr_cache[(enc_fn, sector_len)]
+        decoder_fn, _ = _get_decoder_for_encoder(dec_fn) if dec_fn else (None, 0)
         ber_points = []
+
         for snr in snr_range:
-            lcg_bits = uniform_random(-500)
-            lcg_noise = uniform_random(-600)
-            noise_sigma = math.sqrt(10) * 10 ** (-snr / 20) * 2 * math.sqrt(2.5 / 2)
-
-            total_errors = 0
-            total_bits = 0
-            for s in range(50):  # 50 sectors for reliable statistics
-                bits = np.array(
-                    [int(lcg_bits.random() > 0.5) for _ in range(sector_len)],
-                    dtype=np.int64,
-                )
-                bits[0] = 0
-                encoded = enc_fn(bits, sector_len)
-                encoded_len = len(encoded)
-
-                # Pre/post padding before channel
-                padded = np.zeros(PRE + encoded_len + PRE, dtype=np.int64)
-                padded[PRE: PRE + encoded_len] = encoded
-                bipolar = make_bipolar(padded)
-
-                ch_out = channel(bipolar, "Perpendicular", 2.5, 201, 10, 0.0, 0.0, {}, s)
-                noise = np.array([gaussian_random(lcg_noise) for _ in range(len(ch_out))],
-                                 dtype=np.float64)
-                ch_out += noise * noise_sigma
-                lpf_out = lpf(ch_out, 20, 0.1)
-
-                # Downsample from PRE*OSR + LPF_front_extension
-                ds_start = PRE * 10 + 10  # 210
-                ds = lpf_out[ds_start: ds_start + encoded_len * 10: 10]
-                eq_out = ds[:encoded_len]
-
-                v_hard, _ = classical_viterbi(10, eq_out, encoded_len, PRI_IMP)
-                # MTR decoder returns 1 value, RLL/TMTR return 2
-                result = dec_fn(v_hard, 0, encoded_len)
-                decoded = result if isinstance(result, np.ndarray) else result[0]
-                compare = min(len(decoded), sector_len)
-                errors = int(np.sum(decoded[:compare] != bits[:compare]))
-                total_errors += errors
-                total_bits += compare
-
-            ber = total_errors / total_bits if total_bits > 0 else 1.0
+            ber, _, _ = run_single_sector_sweep_with_gpr(
+                "Perpendicular", enc_fn, sector_len, snr, 50,
+                eq_coeff_init=eq_coeff, gpr_target_init=gpr_target,
+                decoder_fn=decoder_fn)
             ber_points.append(ber)
+            print(f"    {name}: SNR={snr}dB BER={ber:.2e}")
+
         ax.semilogy(snr_range, ber_points, "o-", label=name,
                     linewidth=2, markersize=8, color=color)
 
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("Bit Error Rate (BER)")
-    ax.set_title("All Encoders - Viterbi + Decoder Round-Trip")
+    ax.set_title("All Encoders - Viterbi + Decoder Round-Trip (GPR Equalizer)")
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
     save_fig("exp13_all_codes_ber.png")
