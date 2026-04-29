@@ -827,16 +827,15 @@ def exp5_ber_snr_viterbi():
                     10000 + trial * 100,
                 )
 
-                # Desired signal: EPR4-shaped target from clean bits
+                # Clean bipolar bits for LMS training signal
                 bits_bipolar = make_bipolar(bits)
-                desired = _causal_fir(bits_bipolar, pri)
 
-                # LMS adaptive equalizer (plain LMS, supervised)
+                # LMS adaptive equalizer (C AdaptEqualizer signature)
                 eq_coeff = np.zeros(NUM_EQ_TAPS)
                 mse, _ = adapt_equalizer(
-                    channel_output, desired, eq_coeff, NUM_EQ_TAPS,
-                    sector_len, pri, len(pri),
-                    start_flag=True, use_nlms=False,
+                    pri, eq_coeff, NUM_EQ_TAPS,
+                    bits_bipolar, channel_output, sector_len,
+                    start_flag=True,
                 )
 
                 # Equalize and detect
@@ -1017,7 +1016,7 @@ def exp7_equalizer_convergence():
 
     # Save final iteration data for plots
     final_ds_output = None
-    final_desired = None
+    final_bipolar_input = None
 
     for iteration in range(num_iterations):
         start = 1 if iteration == 0 else 0
@@ -1049,13 +1048,12 @@ def exp7_equalizer_convergence():
         # Extract inner region (strip pre/post padding)
         ds_output = ds_full[PRE * OSR: PRE * OSR + sector_len * OSR: OSR][:sector_len]
 
-        # Desired output = PR-shaped signal from clean bits through PR FIR
+        # Clean bipolar bits for LMS training signal
         bits_bipolar = make_bipolar(padded[PRE: PRE + sector_len])
-        desired = _causal_fir_simple(bits_bipolar, pri_imp_res)
 
         mse, avg_lmse = adapt_equalizer(
-            ds_output, desired, eq_coeff, num_eq_taps,
-            sector_len, pri_imp_res, pri_imp_res_length=4,
+            pri_imp_res, eq_coeff, num_eq_taps,
+            bits_bipolar, ds_output, sector_len,
             start_flag=start,
         )
         mse_history.append(mse)
@@ -1063,7 +1061,7 @@ def exp7_equalizer_convergence():
 
         if iteration == num_iterations - 1:
             final_ds_output = ds_output
-            final_desired = desired
+            final_bipolar_input = bits_bipolar
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -1099,7 +1097,9 @@ def exp7_equalizer_convergence():
             applied = aligned_eq
         x = np.arange(len(applied))
         ax.plot(x, applied, "b-", label="Equalizer Output", linewidth=1.5, alpha=0.7)
-        ax.plot(x, final_desired, "r--", label="Desired PR Response", linewidth=2)
+        if final_bipolar_input is not None:
+            desired_pr = causal_fir(final_bipolar_input, sector_len, pri_imp_res)
+            ax.plot(x, desired_pr, "r--", label="Desired PR Response", linewidth=2)
         ax.set_title("Equalizer Output vs Desired PR (delay-compensated)")
     ax.set_xlabel("Sample Index")
     ax.set_ylabel("Amplitude")
@@ -1108,8 +1108,10 @@ def exp7_equalizer_convergence():
 
     # PR Target vs GPR Target
     ax = axes[1, 1]
-    gpr_target, _ = find_gpr_target(ds_output, desired, num_eq_taps,
-                                     gpr_target_length=len(pri_imp_res))
+    if final_bipolar_input is not None:
+        gpr_target, _ = find_gpr_target(
+            final_ds_output, final_bipolar_input, num_eq_taps,
+            gpr_target_length=len(pri_imp_res))
     ax.bar(range(len(pri_imp_res)), pri_imp_res, color="steelblue",
            alpha=0.7, width=0.4, label="PR Target")
     ax.bar(range(len(gpr_target)) + 0.4, gpr_target, color="coral",

@@ -141,173 +141,94 @@ def lpf(
 
 
 def adapt_equalizer(
-    equalized_output: np.ndarray,
-    desired_output: np.ndarray,
+    pri_imp_res: np.ndarray,
     eq_coeff: np.ndarray,
     num_eq_taps: int,
+    clean_bits: np.ndarray,
+    channel_output: np.ndarray,
     sector_length: int,
-    pri_imp_res: np.ndarray | None = None,
-    pri_imp_res_length: int = 0,
     start_flag: int = 1,
-    use_nlms: bool = True,
 ) -> Tuple[float, float]:
-    """Adaptive equalizer (LMS / NLMS).
+    """LMS adaptive equalizer (translation of C ``AdaptEqualizer``).
 
-    Updates ``eq_coeff`` in-place and returns the MSE and average error
-    for the current sector.
+    The equalizer learns to invert the channel by comparing its output
+    against a desired PR-target signal computed from *clean_bits*.
 
-    Supervised mode (default): uses *desired_output* as the training
-    target.  Falls back to the original blind PR-target mode when
-    ``desired_output`` is ``None``.
+    In the C code::
+
+        CausalFIR(PaddedEncodedBits, SectorLength, PRActualOutput,
+                  PRImpRes, PRImpResLength);
+        // then LMS: EqCoeff[j] -= 2*STEP*EqError*PaddedDS[i+j]
 
     Parameters
     ----------
-    equalized_output : np.ndarray
-        Raw channel output (received samples).
-    desired_output : np.ndarray | None
-        Desired (training) signal.  If ``None``, the function reverts
-        to the original blind PR-target equalization.
+    pri_imp_res : np.ndarray
+        PR impulse response (target shape, e.g. EPR4 ``[1,1,-1,-1]``).
     eq_coeff : np.ndarray
-        Equalizer coefficients (updated in-place).
+        Equalizer coefficients array (modified **in-place**).
     num_eq_taps : int
         Number of equalizer taps.
+    clean_bits : np.ndarray
+        Clean bipolar bits (0/1 → ±1), same length as the sector.
+        These are convolved with *pri_imp_res* to form the desired
+        PR-target output.
+    channel_output : np.ndarray
+        Received channel samples (after LPF + downsampling).
     sector_length : int
         Number of samples to process.
-    pri_imp_res : np.ndarray | None
-        PR target impulse response (used only in blind mode).
-    pri_imp_res_length : int
-        Length of the PR impulse response (used only in blind mode).
     start_flag : int
-        If non-zero, re-initialise equalizer coefficients.
-    use_nlms : bool
-        When ``True`` (default) use Normalised LMS for stable convergence.
+        If non-zero, re-initialise coefficients to zero.
 
     Returns
     -------
     tuple[float, float]
-        (MSE, average_error) for the sector.
+        (MSE, average_LMS_error) for the sector.
     """
+    pri_imp_res_length = len(pri_imp_res)
+
     # Initialise equalizer coefficients on start
     if start_flag:
         eq_coeff[:] = 0.0
 
-    supervised = desired_output is not None
+    # --- Desired PR target output = causal_fir(clean_bits, pri_imp_res) ---
+    pr_actual_output = causal_fir(clean_bits, sector_length, pri_imp_res)
 
-    if supervised:
-        _adapt_equalizer_supervised(
-            equalized_output, desired_output, eq_coeff,
-            num_eq_taps, sector_length, use_nlms,
-        )
-        # Compute MSE against desired output
-        front_pad = num_eq_taps // 2
-        padded_ds = np.zeros(sector_length + num_eq_taps - 1)
-        padded_ds[front_pad: front_pad + sector_length] = equalized_output[
-            :sector_length
-        ]
-        eq_out = np.zeros(sector_length, dtype=np.float64)
-        for i in range(sector_length):
-            for j in range(num_eq_taps):
-                eq_out[i] += eq_coeff[j] * padded_ds[i + j]
-        diff = eq_out - desired_output[:sector_length]
-        mse = float(np.sum(diff * diff))
-        avg_err = float(np.mean(np.abs(diff))) if sector_length > 0 else 0.0
-    else:
-        # Blind PR-target mode (original C behaviour)
-        if pri_imp_res is None:
-            pri_imp_res = np.array([1.0])
-            pri_imp_res_length = 1
-        pr_actual_output = causal_fir(
-            equalized_output, sector_length, pri_imp_res)
-        eq_output_temp = non_causal_fir(
-            equalized_output, sector_length, eq_coeff)
-
-        front_pad = num_eq_taps // 2
-        back_pad = num_eq_taps - 1
-        padded_len = sector_length + front_pad + back_pad
-        padded_ds = np.zeros(padded_len)
-        padded_ds[front_pad: front_pad + sector_length] = equalized_output[
-            :sector_length
-        ]
-
-        lmse_total = 0.0
-        for i in range(sector_length):
-            eq_output = 0.0
-            for j in range(num_eq_taps):
-                eq_output += eq_coeff[j] * padded_ds[i + j]
-
-            eq_error = eq_output - pr_actual_output[i]
-            lmse_total += eq_error * eq_error
-
-            for j in range(num_eq_taps):
-                eq_coeff[j] -= (
-                    2.0 * LMS_STEP_SIZE * eq_error * padded_ds[i + j])
-
-        mse = 0.0
-        for i in range(sector_length):
-            diff = pr_actual_output[i] - eq_output_temp[i]
-            mse += diff * diff
-
-        avg_err = lmse_total / sector_length if sector_length > 0 else 0.0
-
-    return float(mse), float(avg_err)
-
-
-def _adapt_equalizer_supervised(
-    equalized_output: np.ndarray,
-    desired_output: np.ndarray,
-    eq_coeff: np.ndarray,
-    num_eq_taps: int,
-    sector_length: int,
-    use_nlms: bool = True,
-) -> None:
-    """Supervised (training-based) adaptive equalizer.
-
-    Uses NLMS (Normalised LMS) by default for stable convergence.
-    Falls back to plain LMS when *use_nlms* is ``False``.
-
-    Parameters
-    ----------
-    equalized_output : np.ndarray
-        Received (channel-affected) samples.
-    desired_output : np.ndarray
-        Desired training samples (same length as equalized_output).
-    eq_coeff : np.ndarray
-        Equalizer coefficients array (modified in-place).
-    num_eq_taps : int
-        Number of taps.
-    sector_length : int
-        Number of samples to process.
-    use_nlms : bool
-        Use normalised step size for robustness.
-    """
-    # Pad input
+    # --- Pad channel output for the equaliser ---
     front_pad = num_eq_taps // 2
-    padded_ds = np.zeros(sector_length + num_eq_taps - 1)
-    padded_ds[front_pad: front_pad + sector_length] = equalized_output[
+    back_pad = num_eq_taps - 1
+    total_pad = sector_length + front_pad + back_pad
+    padded_ds = np.zeros(total_pad, dtype=np.float64)
+    padded_ds[front_pad: front_pad + sector_length] = channel_output[
         :sector_length
     ]
 
-    desired = desired_output[:sector_length]
+    # --- LMS coefficient update ---
+    lmse_total = 0.0
+    for i in range(sector_length):
+        eq_output = 0.0
+        for j in range(num_eq_taps):
+            eq_output += eq_coeff[j] * padded_ds[i + j]
 
-    if use_nlms:
-        # --- NLMS: normalised LMS ---
-        mu = 2.0 * LMS_STEP_SIZE  # scale factor (max step = mu)
-        for i in range(sector_length):
-            x = padded_ds[i: i + num_eq_taps].copy()
-            eq_out = eq_coeff @ x
-            error = eq_out - desired[i]
+        eq_error = eq_output - pr_actual_output[i]
+        lmse_total += eq_error * eq_error
 
-            norm = np.dot(x, x) + NLMS_EPSILON
-            update = (mu / norm) * error * x
-            eq_coeff[:num_eq_taps] -= update
-    else:
-        # --- Plain LMS (for API compatibility with blind mode) ---
-        mu = 2.0 * LMS_STEP_SIZE
-        for i in range(sector_length):
-            x = padded_ds[i: i + num_eq_taps].copy()
-            eq_out = eq_coeff @ x
-            error = eq_out - desired[i]
-            eq_coeff[:num_eq_taps] -= mu * error * x
+        for j in range(num_eq_taps):
+            eq_coeff[j] -= 2.0 * LMS_STEP_SIZE * eq_error * padded_ds[i + j]
+
+    # --- MSE: difference between PR output and equalized output ---
+    mse = 0.0
+    for i in range(sector_length):
+        eq_out_val = 0.0
+        for j in range(num_eq_taps):
+            eq_out_val += eq_coeff[j] * padded_ds[i + j]
+        diff = pr_actual_output[i] - eq_out_val
+        mse += diff * diff
+
+    avg_lmse = lmse_total / sector_length if sector_length > 0 else 0.0
+
+    return float(mse), float(avg_lmse)
+
+
 
 
 def apply_equalizer(
@@ -345,77 +266,211 @@ def apply_equalizer(
     return output
 
 
-def find_gpr_target(
-    eq_output: np.ndarray,  # equalized output (received)
-    pr_output: np.ndarray,  # desired PR target output
-    num_taps: int,
-    gpr_target_length: int = 4,
-) -> tuple:
-    """Find optimal GPR (Generalized Partial Response) equalizer coefficients.
+def _corr(a: np.ndarray, a_len: int,
+          b: np.ndarray, b_len: int,
+          shift: int) -> float:
+    """Cross-correlation at a single lag, matching C ``Corr()``.
 
-    Solves the normal equations: (R + alpha*I) * a = p
-    where R is the autocorrelation matrix of the input,
-    a is the equalizer coefficient vector,
-    p is the cross-correlation between input and desired output.
+    Computes ``sum_k A[k] * B[k - shift]`` over the overlapping region.
+    B is shifted to the right with respect to A (positive shift delays B).
 
-    This matches the C FindGPRTarget() function.
+    Parameters
+    ----------
+    a : np.ndarray
+        First array.
+    a_len : int
+        Number of valid samples in *a*.
+    b : np.ndarray
+        Second array.
+    b_len : int
+        Number of valid samples in *b*.
+    shift : int
+        Lag (can be negative).
 
-    Args:
-        eq_output: Actual equalized output (received signal).
-        pr_output: Desired PR target output.
-        num_taps: Number of equalizer taps.
-        gpr_target_length: Length of PR target for energy constraint.
-
-    Returns:
-        (gpr_target, eq_coeff) where:
-        - gpr_target: GPR target coefficients (length gpr_target_length)
-        - eq_coeff: Equalizer coefficients (length num_taps)
+    Returns
+    -------
+    float
+        Correlation value.
     """
-    data_length = len(eq_output)
-
-    # Default GPR target shapes matching common PR responses
-    if gpr_target_length == 3:
-        gpr_target = np.array([1.0, 0.0, -1.0], dtype=np.float64)
-    elif gpr_target_length == 4:
-        gpr_target = np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float64)  # EPR4
-    elif gpr_target_length == 5:
-        gpr_target = np.array([1.0, 1.0, 0.0, -1.0, -1.0], dtype=np.float64)  # PR10
+    if shift >= 0:
+        start = shift
     else:
-        gpr_target = np.zeros(gpr_target_length, dtype=np.float64)
-        gpr_target[0] = 1.0
-        gpr_target[1] = 1.0
-        gpr_target[-1] = -1.0
-        gpr_target[-2] = -1.0
+        start = 0
+    if a_len - 1 <= shift + b_len - 1:
+        finish = a_len - 1
+    else:
+        finish = shift + b_len - 1
+    if start > finish:
+        return 0.0
+    result = 0.0
+    for k in range(start, finish + 1):
+        result += a[k] * b[k - shift]
+    return result
 
-    # Compute autocorrelation matrix R of eq_output
-    # R[i][j] = corr(eq_output, j - i)
-    R = np.zeros((num_taps, num_taps), dtype=np.float64)
-    for i in range(num_taps):
-        for j in range(num_taps):
-            lag = j - i
-            n = data_length - abs(lag)
-            if n > 0:
-                if lag >= 0:
-                    R[i, j] = np.sum(eq_output[:n] * eq_output[lag : lag + n]) / n
-                else:
-                    R[i, j] = np.sum(eq_output[:n] * eq_output[-lag : -lag + n]) / n
 
-    # Add small regularization (diagonal loading) for numerical stability
-    alpha = 1e-6
-    R += alpha * np.eye(num_taps)
+def _matrix_inv(A: np.ndarray) -> np.ndarray:
+    """Gauss-Jordan matrix inverse, matching C ``MatrixInv()``.
 
-    # Compute cross-correlation vector p between eq_output and pr_output
-    p = np.zeros(num_taps, dtype=np.float64)
-    min_len = min(data_length, len(pr_output))
-    if min_len > 0:
-        for i in range(num_taps):
-            if i < min_len:
-                p[i] = np.sum(eq_output[:min_len - i] * pr_output[i:min_len]) / (min_len - i)
+    Parameters
+    ----------
+    A : np.ndarray
+        Square matrix to invert.
 
-    # Solve R * a = p for equalizer coefficients
-    try:
-        eq_coeff = np.linalg.solve(R, p)
-    except np.linalg.LinAlgError:
-        eq_coeff = np.linalg.lstsq(R, p, rcond=None)[0]
+    Returns
+    -------
+    np.ndarray
+        Inverse of A.
+    """
+    m = A.shape[0]
+    A = A.astype(np.float64).copy()
+    B = np.eye(m, dtype=np.float64)
+
+    for c in range(m):
+        # Swap row c with any row that has a non-zero element in column c
+        if A[c, c] == 0:
+            for i in range(m):
+                if A[i, c] != 0:
+                    A[[c, i]] = A[[i, c]]
+                    B[[c, i]] = B[[i, c]]
+                    break
+
+        # Scale row c so that A[c][c] == 1
+        if A[c, c] != 1:
+            temp = A[c, c]
+            A[c] /= temp
+            B[c] /= temp
+
+        # Eliminate column c in all other rows
+        for i in range(m):
+            if i != c:
+                temp = A[i, c]
+                A[i] -= temp * A[c]
+                B[i] -= temp * B[c]
+
+    return B
+
+
+def find_gpr_target(
+    channel_output: np.ndarray,  # s: downsampled channel output
+    bipolar_input: np.ndarray,  # a: clean bipolar bits (0/1 -> +/-1)
+    num_taps: int,  # N: equalizer tap count
+    gpr_target_length: int = 4,  # L: GPR target length
+) -> tuple:
+    """Compute GPR (Generalized Partial Response) equalizer coefficients.
+
+    Exact translation of the C ``FindGPRTarget()`` from MagneticDisk.c
+    (lines 855-1116).  Solves the optimality conditions derived from
+    Jaekyun Moon et al., "Equalization for Maximum Likelihood Detectors",
+    IEEE Trans. Mag., Vol 31, No. 2, Mar 1995.
+
+    Algorithm (matching C exactly):
+
+    1. Build Toeplitz autocorrelation matrices **R** (from channel
+       output ``s``) and **A** (from bipolar input ``a``), plus
+       cross-correlation matrix **T** (between ``s`` and ``a``).
+    2. Compute ``R_inv = inv(R)`` via Gauss-Jordan elimination.
+    3. Compute ``Temp2 = inv(A - T' * R_inv * T)``.
+    4. **GPR target**: ``G = Lambda * Temp2[:, 0]`` where
+       ``Lambda = 1 / Temp2[0][0]`` (monic constraint ``G[0] = 1``).
+    5. **Equalizer taps**: ``F = R_inv * T * G`` (non-causal FIR
+       stored in reverse order).
+
+    Parameters
+    ----------
+    channel_output : np.ndarray
+        Downsampled channel output (received samples), length >= N+L.
+    bipolar_input : np.ndarray
+        Clean bipolar input bits (0/1 → ±1), same length as
+        ``channel_output``.
+    num_taps : int
+        Number of equalizer taps (N, typically 21).
+    gpr_target_length : int
+        Length of the GPR target (L, e.g. 4 for EPR4).
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(gpr_target, eq_coeff)`` where ``gpr_target`` has length
+        ``gpr_target_length`` and ``eq_coeff`` has length ``num_taps``.
+    """
+    data_length = len(channel_output)
+    N = num_taps
+    L = gpr_target_length
+    K = N // 2  # Will work for both N even and odd
+
+    # --- Compute first row of R (Toeplitz autocorrelation of s) ---
+    r_row = np.zeros(N, dtype=np.float64)
+    for i in range(N):
+        r_row[i] = _corr(channel_output, data_length,
+                         channel_output, data_length, i)
+
+    # Fill R using Toeplitz symmetry
+    R = np.zeros((N, N), dtype=np.float64)
+    for i in range(N):
+        for j in range(N):
+            R[i, j] = r_row[abs(j - i)]
+
+    # --- Compute first row of A (Toeplitz autocorrelation of a) ---
+    a_row = np.zeros(L, dtype=np.float64)
+    for i in range(L):
+        a_row[i] = _corr(bipolar_input, data_length,
+                         bipolar_input, data_length, i)
+
+    # Fill A using Toeplitz symmetry
+    A = np.zeros((L, L), dtype=np.float64)
+    for i in range(L):
+        for j in range(L):
+            A[i, j] = a_row[abs(j - i)]
+
+    # --- Compute T (cross-correlation between s and a) ---
+    # T[i][j] = Corr(s, a, K - i + j)
+    T = np.zeros((N, L), dtype=np.float64)
+    for i in range(N):
+        for j in range(L):
+            T[i, j] = _corr(channel_output, data_length,
+                            bipolar_input, data_length,
+                            K - i + j)
+
+    # --- Compute R_inv via Gauss-Jordan ---
+    R_inv = _matrix_inv(R)
+
+    # --- Compute Temp1 = R_inv * T ---
+    temp1 = R_inv @ T  # [N x L]
+
+    # --- Compute T' (transpose) ---
+    T_T = T.T  # [L x N]
+
+    # --- Compute Temp2 = T' * Temp1 = T' * R_inv * T ---
+    temp2 = T_T @ temp1  # [L x L]
+
+    # --- Compute A_temp = A - Temp2 ---
+    a_temp = A - temp2
+
+    # --- Compute A_temp_inv via Gauss-Jordan (stored back in temp2) ---
+    # Note: C reuses Temp2 variable
+    temp2 = _matrix_inv(a_temp)
+
+    # --- Compute Lambda = 1 / Temp2[0][0] ---
+    Lambda = 1.0 / temp2[0, 0]
+
+    # --- Compute GPR target G = Lambda * Temp2[:, 0] ---
+    gpr_target = Lambda * temp2[:, 0]
+
+    # Monic constraint check (matches C: fabs(G[0] - 1.0) > PRE)
+    if abs(gpr_target[0] - 1.0) > 1e-4:
+        # Normalize to enforce monic constraint
+        gpr_target /= gpr_target[0]
+
+    # --- Compute equalizer coefficients F = R_inv * T * G ---
+    # Compute T * G first
+    t_g = T @ gpr_target  # [N]
+
+    # Compute R_inv * (T * G)
+    rinv_tg = R_inv @ t_g  # [N]
+
+    # F is stored in reverse order (C: F[N-1-i] = Temp1[i][0])
+    eq_coeff = np.zeros(N, dtype=np.float64)
+    for i in range(N):
+        eq_coeff[N - 1 - i] = rinv_tg[i]
 
     return gpr_target, eq_coeff
