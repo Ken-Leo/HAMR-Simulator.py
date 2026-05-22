@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-labelledby="title desc">
+  <title id="title">HAMR Simulator Logo</title>
+  <desc id="desc">A stylized magnetic platter with a heat beam and signal wave, representing HAMR channel simulation.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#081324"/>
+      <stop offset="100%" stop-color="#1d3557"/>
+    </linearGradient>
+
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ff8a00"/>
+      <stop offset="100%" stop-color="#ff3d00"/>
+    </linearGradient>
+
+    <linearGradient id="track" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5cc8ff"/>
+      <stop offset="100%" stop-color="#3a86ff"/>
+    </linearGradient>
+
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="640" height="640" rx="120" fill="url(#bg)"/>
+
+  <circle cx="320" cy="320" r="220" fill="none" stroke="#86b6f6" stroke-width="14" opacity="0.95"/>
+  <circle cx="320" cy="320" r="172" fill="none" stroke="#74a7ea" stroke-width="10" opacity="0.85"/>
+  <circle cx="320" cy="320" r="126" fill="none" stroke="#5f95dc" stroke-width="8" opacity="0.75"/>
+
+  <path d="M 70 240 L 440 300" stroke="url(#beam)" stroke-width="28" stroke-linecap="round" filter="url(#glow)" opacity="0.95"/>
+
+  <path d="M 125 418 C 170 368, 215 468, 260 418 C 305 368, 350 468, 395 418 C 440 368, 485 468, 530 418"
+        fill="none" stroke="url(#track)" stroke-width="12" stroke-linecap="round"/>
+
+  <circle cx="320" cy="320" r="34" fill="#e6f0ff"/>
+  <circle cx="320" cy="320" r="15" fill="#24476d"/>
+
+  <g transform="translate(88,84)">
+    <rect width="190" height="66" rx="18" fill="#0f2740" stroke="#5cc8ff" stroke-width="2"/>
+    <text x="95" y="43" text-anchor="middle" fill="#eaf4ff"
+          font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700">HAMR</text>
+  </g>
+</svg>
