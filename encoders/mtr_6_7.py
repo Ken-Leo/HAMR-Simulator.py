@@ -10,6 +10,8 @@ consecutive codewords to resolve constraint violations.
 Based on EncodingFunctions.c Enc_6By7MTRCode.
 """
 
+from __future__ import annotations
+
 import math
 import pathlib
 

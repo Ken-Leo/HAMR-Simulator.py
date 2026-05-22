@@ -220,7 +220,8 @@ class TestMTR67Decoder:
 
         padded = _make_perfect_viterbi_output_mtr(user_bits, sector_len)
 
-        decoded = dec_6by7mtr_code(padded, 20, sector_len)
+        decoded, invalid_cw = dec_6by7mtr_code(padded, 20, sector_len)
+        assert invalid_cw == 0  # C implementation returns void, always 0
 
         # decoded_len = 180, only first 181 elements are valid
         compare_len = min(len(decoded), 181)
@@ -238,17 +239,19 @@ class TestMTR67Decoder:
 
         padded = _make_perfect_viterbi_output_mtr(user_bits, sector_len)
 
-        decoded = dec_6by7mtr_code(padded, 20, sector_len)
+        decoded, invalid_cw = dec_6by7mtr_code(padded, 20, sector_len)
 
         compare_len = min(len(decoded), 181)
         error_rate = int(np.sum(decoded[:compare_len] != user_bits[:compare_len])) / compare_len
         assert error_rate < 0.05, f"MTR substitution undo error rate too high: {error_rate:.2%}"
 
     def test_output_length(self):
-        """Decoded output length should match sector_length."""
+        """Decoded output length should be based on codeword blocks."""
+        # For MTR(6/7): coded_len=20 → nrzi_len=19 → num_blocks=2 → decoded=13
         padded = np.zeros(60, dtype=np.int64)
-        decoded = dec_6by7mtr_code(padded, 20, 20)
-        assert len(decoded) == 20
+        decoded, invalid_cw = dec_6by7mtr_code(padded, 20, 20)
+        assert len(decoded) == 13  # 2 blocks * 6 + 1
+        assert invalid_cw == 0
 
 
 # ---------------------------------------------------------------------------

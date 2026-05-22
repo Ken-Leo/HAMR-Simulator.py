@@ -65,7 +65,7 @@ def dec_6by7mtr_code(
     nrz_viterbi_output: np.ndarray,
     pre_padding_length: int,
     sector_length: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, int]:
     """Decode 6/7 MTR(2;8) code.
 
     Steps (matching C Dec_6By7MTRCode):
@@ -81,21 +81,32 @@ def dec_6by7mtr_code(
         sector_length: Length of the coded sector (before padding).
 
     Returns:
-        NRZ decoded output array of length ``sector_length``.
+        A tuple ``(decoded_output, invalid_codeword_count)`` where
+        ``decoded_output`` is an int64 array of NRZ user bits.
+        The C implementation returns void (no invalid count), so the
+        count is always 0 for consistency with the other decoders.
     """
-    # Strip padding
+    # Strip padding.
+    # The decoder needs the actual coded length. If sector_length matches
+    # the available data length (after removing padding), use it directly.
+    # Otherwise, derive from the input array (handles cases where the
+    # encoded length differs from the user sector length).
+    available = len(nrz_viterbi_output) - pre_padding_length
+    if sector_length <= available:
+        coded_len = sector_length
+    else:
+        coded_len = available
     coded = nrz_viterbi_output[
-        pre_padding_length: pre_padding_length + sector_length
+        pre_padding_length: pre_padding_length + coded_len
     ].copy()
 
     # NRZ -> NRZI conversion
-    nrzi_len = sector_length - 1
+    nrzi_len = coded_len - 1
     nrzi = np.zeros(nrzi_len, dtype=np.int64)
-    for i in range(1, sector_length):
+    for i in range(1, coded_len):
         nrzi[i - 1] = abs(int(coded[i]) - int(coded[i - 1]))
 
     # Detect and undo substitutions
-    decoded_rate = 6.0 / 7.0
     num_blocks = nrzi_len // 7
 
     for i in range(num_blocks - 1):
@@ -107,9 +118,9 @@ def dec_6by7mtr_code(
         if (nrzi[base + 4] == 0 and nrzi[base + 5] == 1
                 and nrzi[base + 6] == 1):
 
-            # Type I: next block starts [1,1,0]
-            if (nrzi[next_base] == 1 and nrzi[next_base + 1] == 1
-                    and nrzi[next_base + 2] == 0):
+            # Type I: next block starts [0,0,1] → undo to [0,0,1]+[1,1,0]
+            if (nrzi[next_base] == 0 and nrzi[next_base + 1] == 0
+                    and nrzi[next_base + 2] == 1):
                 nrzi[base + 4] = 0
                 nrzi[base + 5] = 0
                 nrzi[base + 6] = 1
@@ -118,11 +129,8 @@ def dec_6by7mtr_code(
                 nrzi[next_base + 2] = 0
                 continue
 
-            # Type II: next block starts [1,1,0] with different current pattern
-            if (nrzi[base + 4] == 1 and nrzi[base + 5] == 0
-                    and nrzi[base + 6] == 1
-                    and nrzi[next_base] == 1
-                    and nrzi[next_base + 1] == 1
+            # Type II: next block starts [0,1,0] → undo to [1,0,1]+[1,1,0]
+            if (nrzi[next_base] == 0 and nrzi[next_base + 1] == 1
                     and nrzi[next_base + 2] == 0):
                 nrzi[base + 4] = 1
                 nrzi[base + 5] = 0
@@ -132,7 +140,7 @@ def dec_6by7mtr_code(
                 nrzi[next_base + 2] = 0
                 continue
 
-            # Type III: next block starts [0,0,0]
+            # Type III: next block starts [0,0,0] → undo [0,1,1]+[0,0,0] to [0,0,0]+[0,0,0]
             if (nrzi[next_base] == 0 and nrzi[next_base + 1] == 0
                     and nrzi[next_base + 2] == 0):
                 nrzi[base + 4] = 0
@@ -144,7 +152,7 @@ def dec_6by7mtr_code(
                 continue
 
     # Decode: every 7 NRZI bits -> 6 user bits
-    nrzi_decoded = np.zeros(int(nrzi_len * decoded_rate), dtype=np.int64)
+    nrzi_decoded = np.zeros(num_blocks * 6, dtype=np.int64)
 
     for i in range(num_blocks):
         block = nrzi[i * 7: (i + 1) * 7]
@@ -162,7 +170,8 @@ def dec_6by7mtr_code(
                 nrzi_decoded[i * 6 + k] = 0
 
     # NRZI decoded -> NRZ output
-    decoded_output = np.zeros(sector_length, dtype=np.int64)
+    decoded_len = num_blocks * 6 + 1
+    decoded_output = np.zeros(decoded_len, dtype=np.int64)
     decoded_output[0] = 0
     for i in range(len(nrzi_decoded)):
         if nrzi_decoded[i] == 0:
@@ -170,4 +179,4 @@ def dec_6by7mtr_code(
         else:
             decoded_output[i + 1] = (decoded_output[i] + 1) % 2
 
-    return decoded_output
+    return decoded_output, 0

@@ -8,96 +8,11 @@ from typing import Tuple
 
 import numpy as np
 
+from channel.fir import non_causal_fir, causal_fir  # noqa: F401 — re-exported
+
 LMS_STEP_SIZE: float = 0.005
 MIN_MSE: float = 0.005
 NLMS_EPSILON: float = 1e-6
-
-
-def non_causal_fir(
-    data: np.ndarray,
-    data_length: int,
-    h: np.ndarray,
-) -> np.ndarray:
-    """Non-causal (symmetric) FIR filter. Centers the filter response.
-
-    The filter coefficients are laid out as:
-        h: ... h[-2] h[-1] h[0] h[1] h[2] ...
-    with h[0] located at index floor(NumTaps / 2).
-
-    Parameters
-    ----------
-    data : np.ndarray
-        Input signal of length ``data_length``.
-    data_length : int
-        Number of valid samples in *data*.
-    h : np.ndarray
-        Filter taps. ``h[floor(NumTaps/2)]`` is the centre tap.
-
-    Returns
-    -------
-    np.ndarray
-        Filtered output of length ``data_length + floor(NumTaps / 2)``.
-    """
-    num_taps = len(h)
-    front_pad_length = num_taps // 2
-    back_pad_length = num_taps - 1
-    total_length = data_length + front_pad_length + back_pad_length
-
-    padded_data = np.zeros(total_length)
-    padded_data[front_pad_length : front_pad_length + data_length] = (
-        data[:data_length]
-    )
-
-    output_length = data_length + front_pad_length
-    output = np.zeros(output_length)
-
-    for i in range(output_length):
-        for j in range(num_taps):
-            output[i] += h[j] * padded_data[i + j]
-
-    return output
-
-
-def causal_fir(
-    data: np.ndarray,
-    data_length: int,
-    h: np.ndarray,
-) -> np.ndarray:
-    """Causal FIR filter.
-
-    Unlike the non-causal version, the output vector has length
-    ``data_length`` (valid samples only; transient samples are discarded).
-
-    Parameters
-    ----------
-    data : np.ndarray
-        Input signal of length ``data_length``.
-    data_length : int
-        Number of valid samples in *data*.
-    h : np.ndarray
-        Filter taps.
-
-    Returns
-    -------
-    np.ndarray
-        Filtered output of length ``data_length``.
-    """
-    num_taps = len(h)
-    pad_len = num_taps - 1
-    total_length = data_length + 2 * pad_len
-
-    padded_data = np.zeros(total_length)
-    padded_data[pad_len : pad_len + data_length] = data[:data_length]
-
-    output = np.zeros(data_length)
-
-    for i in range(pad_len, data_length + pad_len):
-        channel_output = 0.0
-        for j in range(num_taps):
-            channel_output += h[j] * padded_data[i - j]
-        output[i - pad_len] = channel_output
-
-    return output
 
 
 def lpf(
@@ -137,7 +52,7 @@ def lpf(
     # Normalise DC gain to 1
     h = h / np.sum(h)
 
-    return non_causal_fir(channel_output, len(channel_output), h)
+    return non_causal_fir(channel_output, h)
 
 
 def adapt_equalizer(
@@ -191,7 +106,7 @@ def adapt_equalizer(
         eq_coeff[:] = 0.0
 
     # --- Desired PR target output = causal_fir(clean_bits, pri_imp_res) ---
-    pr_actual_output = causal_fir(clean_bits, sector_length, pri_imp_res)
+    pr_actual_output = causal_fir(clean_bits, pri_imp_res)
 
     # --- Pad channel output for the equaliser ---
     front_pad = num_eq_taps // 2

@@ -6,6 +6,8 @@ transitions (run-length limited constraint d=0, k=2).
 Based on EncodingFunctions.c Enc_4By5RLLCode.
 """
 
+from __future__ import annotations
+
 import math
 import pathlib
 

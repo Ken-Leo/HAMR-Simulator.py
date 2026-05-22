@@ -93,7 +93,7 @@ class TestMTR67Encoder:
         padded = np.zeros(len(encoded) + pre_pad, dtype=np.int64)
         padded[pre_pad: pre_pad + len(encoded)] = encoded
 
-        decoded = dec_6by7mtr_code(padded, pre_pad, sector_len)
+        decoded, _ = dec_6by7mtr_code(padded, pre_pad, sector_len)
 
         # MTR (rate 6/7): decoded_len = 210 * 6/7 = 180
         compare_len = min(len(decoded), 181)

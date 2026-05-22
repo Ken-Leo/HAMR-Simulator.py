@@ -13,6 +13,7 @@ Based on the C main() function in MagneticDisk.c (lines 3356-4688).
 
 from __future__ import annotations
 
+
 import csv
 import math
 import os
@@ -23,9 +24,9 @@ from typing import Any
 
 import numpy as np
 
-from channel.channel import channel
+from channel.channel import channel, FullHamrChannel
 from channel.lpf import lpf
-from channel.math_utils import LCG, gaussian_random, uniform_random
+from channel.math_utils import LCG, CachedGaussian, gaussian_random, uniform_random
 from decoders.mtr_6_7 import dec_6by7mtr_code
 from decoders.rll_4_5 import dec_4by5rll_code
 from decoders.tmtr_8_9 import dec_8by9tmtr_code
@@ -33,6 +34,10 @@ from encoders.mtr_6_7 import enc_6by7mtr_code
 from encoders.rll_4_5 import enc_4by5rll_code
 from encoders.tmtr_8_9 import enc_8by9tmtr_code
 from equalizer_detector.detector import classical_viterbi, classical_sova
+from equalizer_detector.constrained_detectors import (
+    viterbi_6by7mtr_code,
+    viterbi_8by9tmtr_code,
+)
 from equalizer_detector.equalizer import (
     adapt_equalizer,
     apply_equalizer,
@@ -163,7 +168,7 @@ def _compute_code_params(config: SimulatorConfig) -> tuple[int, int, float]:
     adjust it to satisfy its internal constraint (e.g. 4Z+1 for RLL).
     """
     if not config.use_encoding:
-        return 1, 1, 1.0
+        return config.sector_length, config.sector_length, 1.0
 
     if config.encoder_type in ("rll_4_5",):
         code_rate = 4.0 / 5.0
@@ -206,6 +211,34 @@ def _decoder_fn(config: SimulatorConfig):
 def _bipolar(bits: np.ndarray) -> np.ndarray:
     """Map 0/1 bits to bipolar: 0 -> -1, 1 -> +1."""
     return 2.0 * bits.astype(np.float64) - 1.0
+
+
+def _causal_fir_simple(data: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """Causal FIR filter producing len(data) output samples.
+
+    Computes the middle portion of the full convolution to match
+    the causal FIR behavior used in the C code for PR target shaping.
+
+    Args:
+        data: Input signal.
+        h: Filter coefficients (e.g., PR target).
+
+    Returns:
+        Output of same length as input.
+    """
+    pad_len = len(h) - 1
+    total_length = len(data) + 2 * pad_len
+    padded = np.zeros(total_length, dtype=np.float64)
+    padded[pad_len: pad_len + len(data)] = data[: len(data)]
+
+    output = np.zeros(len(data), dtype=np.float64)
+    for i in range(pad_len, len(data) + pad_len):
+        channel_output = 0.0
+        for j in range(len(h)):
+            channel_output += h[j] * padded[i - j]
+        output[i - pad_len] = channel_output
+
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +315,16 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
     enc_fn = _encoder_fn(config)
     dec_fn = _decoder_fn(config)
 
+    # Initialize full HAMR channel if selected (does PW50 calculation)
+    full_hamr: FullHamrChannel | None = None
+    over_sampled_bit_length = 0.0
+    if config.channel_type.lower() == "hamr":
+        full_hamr = FullHamrChannel(config, nd, config.osr)
+        over_sampled_bit_length = full_hamr.over_sampled_bit_length
+        print(f"HAMR channel initialized: PW50={full_hamr.pw50:.1f} nm, "
+              f"OSBL={over_sampled_bit_length:.2f} nm")
+
     results: list[dict[str, Any]] = []
-    over_sampled_bit_length = 0.0  # Will be computed for HAMR channel
 
     start_time = time.time()
 
@@ -306,6 +347,7 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
         # RNG seeds (matching C: idum1=-500, idum2=-600)
         lcg_bits = uniform_random(-500)
         lcg_noise = uniform_random(-600)
+        cached_gauss = CachedGaussian(lcg_noise)  # matches C static cache
 
         # Equalizer adaptation mode (use high SNR first)
         eq_adapted = False
@@ -341,53 +383,62 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
                 # Pad
                 padded = np.zeros(padded_sector_length, dtype=np.int64)
                 padded[
-                    config.pre_padding_length: config.pre_padding_length + encoded_len
+                    config.pre_padding_length: config.pre_padding_length + len(encoded)
                 ] = encoded
 
-                # Bipolar
-                bipolar = _bipolar(padded)
+                # Channel: pass unipolar bits; channel() does its own bipolar+oversampling
+                # Matches C: NonCausalFIR(OSBipolarBits, OSSectorLength, ...)
+                oss_len = len(padded) * config.osr
+                if full_hamr is not None:
+                    # Use full physics-based HAMR channel
+                    ch_output = full_hamr(padded, adapt_sector,
+                                          disable_media_noise=True)
+                else:
+                    # C main(): during adaptation (j<0), LongPerp passes
+                    # sigma_jitter=0, sigma_pulse_broad=0 to disable media noise
+                    ch_output = channel(
+                        padded,
+                        config.channel_type,
+                        nd,
+                        config.num_channel_taps,
+                        config.osr,
+                        0.0,  # sigma_jitter = 0 (adaptive mode)
+                        0.0,  # sigma_pulse_broad = 0 (adaptive mode)
+                        hamr_params,
+                        adapt_sector,
+                        nlts_k,
+                        nlts_rho,
+                        over_sampled_bit_length,
+                    )
 
-                # Channel
-                ch_output = channel(
-                    bipolar,
-                    config.channel_type,
-                    nd,
-                    config.num_channel_taps,
-                    config.osr,
-                    config.sigma_jitter,
-                    config.sigma_pulse_broad,
-                    hamr_params,
-                    adapt_sector,
-                    nlts_k,
-                    nlts_rho,
-                    over_sampled_bit_length,
-                )
-
-                # Add noise
-                oss_len = len(bipolar) * config.osr
-                noise = np.array(
-                    [
-                        gaussian_random(lcg_noise)
-                        for _ in range(oss_len)
-                    ],
+                # Add noise: C code adds noise only to inner region
+                # from PrePaddingLength*OSR to OSSectorLength - PostPaddingLength*OSR
+                # of the first OSSectorLength elements (not the FIR tail).
+                inner_start = config.pre_padding_length * config.osr
+                inner_count = oss_len - (config.pre_padding_length +
+                                         config.post_padding_length) * config.osr
+                # Generate noise one at a time for the inner region (matches C count)
+                noise_vec = np.array(
+                    [cached_gauss() for _ in range(inner_count)],
                     dtype=np.float64,
                 )
-                ch_output = ch_output + noise * adapt_noise_sigma
+                ch_output[inner_start: inner_start + inner_count] += noise_vec * adapt_noise_sigma
 
-                # LPF
-                lpf_output = lpf(ch_output, config.num_lpf_taps - 1, 1.0 / config.osr)
+                # LPF: C code calls LPF(ChannelOutput, OSSectorLength, ...)
+                # meaning LPF only sees first OSSectorLength elements of channel output
+                ch_for_lpf = ch_output[:oss_len]
+                lpf_output = lpf(ch_for_lpf, config.num_lpf_taps - 1, 1.0 / config.osr)
 
-                # Downsample: extract exactly encoded_len elements.
-                # The LPF extends the signal, so we compute stop from encoded_len * OSR.
-                ds_start = config.pre_padding_length * config.osr
-                ds_stop = ds_start + encoded_len * config.osr
-                ds_output = lpf_output[ds_start: ds_stop: config.osr]
+                # Downsample: C code does DSOutput[i] = LPFOutput[i * OSR]
+                ds_output = lpf_output[:: config.osr][:padded_sector_length]
 
-                # Store for GPR target computation
-                concat_input.append(padded[config.pre_padding_length: config.pre_padding_length + encoded_len])
-                concat_output.append(ds_output[config.pre_padding_length: config.pre_padding_length + encoded_len])
+                # Store for GPR target computation (bipolar, matching C code)
+                concat_input.append(
+                    _bipolar(padded[config.pre_padding_length: config.pre_padding_length + len(encoded)])
+                )
+                concat_output.append(ds_output[config.pre_padding_length: config.pre_padding_length + len(encoded)])
 
-            # Compute GPR target
+            # Compute GPR target (fallback - LMS uses desired_signal instead)
             if concat_input:
                 full_input = np.concatenate(concat_input)
                 full_output = np.concatenate(concat_output)
@@ -396,6 +447,70 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
                     gpr_target_length=len(config.pri_imp_res),
                 )
                 eq_adapted = True
+
+        # Phase 1b: LMS equalizer adaptation for FixedPRTarget
+        # (C code uses AdaptEqualizer for both FixedPRTarget and GPRTarget)
+        if config.equalizer_type == "FixedPRTarget" and config.num_eq_sectors > 0:
+            adapt_snr = 50.0  # High SNR for clean adaptation
+            adapt_noise_sigma = (
+                math.sqrt(config.osr)
+                * math.pow(10, -adapt_snr / 20.0)
+                * 2.0
+                * math.sqrt(nd / 2.0)
+            )
+
+            pri_imp_res = np.array(config.pri_imp_res, dtype=np.float64)
+            eq_coeff = np.zeros(config.num_eq_taps, dtype=np.float64)
+            start_flag = 1
+
+            for adapt_sector in range(config.num_eq_sectors):
+                user_bits = np.array(
+                    [int(lcg_bits.random() > 0.5) for _ in range(sector_length + 4)],
+                    dtype=np.int64,
+                )
+                if enc_fn is not None:
+                    user_bits[0] = 0
+                    encoded = enc_fn(user_bits, sector_length)
+                else:
+                    encoded = user_bits[:sector_length].copy()
+
+                padded = np.zeros(padded_sector_length, dtype=np.int64)
+                padded[config.pre_padding_length: config.pre_padding_length + len(encoded)] = encoded
+                oss_len = len(padded) * config.osr
+
+                if full_hamr is not None:
+                    ch_output = full_hamr(padded, adapt_sector,
+                                          disable_media_noise=True)
+                else:
+                    ch_output = channel(
+                        padded, config.channel_type, nd, config.num_channel_taps,
+                        config.osr, 0.0, 0.0,
+                    )
+                inner_start = config.pre_padding_length * config.osr
+                inner_count = oss_len - (config.pre_padding_length +
+                                         config.post_padding_length) * config.osr
+                noise_vec = np.array(
+                    [cached_gauss() for _ in range(inner_count)],
+                    dtype=np.float64,
+                )
+                ch_output[inner_start: inner_start + inner_count] += noise_vec * adapt_noise_sigma
+
+                lpf_output = lpf(ch_output[:oss_len], config.num_lpf_taps - 1, 1.0 / config.osr)
+                ds_output = lpf_output[:: config.osr][:padded_sector_length]
+
+                # Clean bipolar bits for desired signal
+                clean_bipolar = _bipolar(padded)[config.pre_padding_length: config.pre_padding_length + len(encoded)]
+                ds_inner = ds_output[config.pre_padding_length: config.pre_padding_length + len(encoded)]
+
+                mse, lmse = adapt_equalizer(
+                    pri_imp_res, eq_coeff, config.num_eq_taps,
+                    clean_bipolar, ds_inner, len(clean_bipolar),
+                    start_flag=start_flag,
+                )
+                start_flag = 0
+
+            eq_adapted = True
+            print(f"  FixedPRTarget LMS adapted: MSE={mse:.4f}, LMS={lmse:.4f}")
 
         # Phase 2: Main simulation loop
         for _ in range(config.max_num_sectors):
@@ -420,40 +535,47 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
             # Pad with zeros
             padded = np.zeros(padded_sector_length, dtype=np.int64)
             padded[
-                config.pre_padding_length: config.pre_padding_length + encoded_len
+                config.pre_padding_length: config.pre_padding_length + len(encoded)
             ] = encoded
-            padded_bipolar = _bipolar(padded)
 
-            # Channel
-            ch_output = channel(
-                padded_bipolar,
-                config.channel_type,
-                nd,
-                config.num_channel_taps,
-                config.osr,
-                config.sigma_jitter,
-                config.sigma_pulse_broad,
-                hamr_params,
-                num_sectors,
-                nlts_k,
-                nlts_rho,
-                over_sampled_bit_length,
-            )
+            # Channel: pass unipolar bits; channel() does its own bipolar+oversampling
+            oss_len = len(padded) * config.osr
+            if full_hamr is not None:
+                # Use full physics-based HAMR channel
+                ch_output = full_hamr(padded, num_sectors,
+                                      disable_media_noise=False)
+            else:
+                ch_output = channel(
+                    padded,
+                    config.channel_type,
+                    nd,
+                    config.num_channel_taps,
+                    config.osr,
+                    config.sigma_jitter,
+                    config.sigma_pulse_broad,
+                    hamr_params,
+                    num_sectors,
+                    nlts_k,
+                    nlts_rho,
+                    over_sampled_bit_length,
+                )
 
-            # Add AWGN noise
-            ch_noise = np.array(
-                [gaussian_random(lcg_noise) for _ in range(len(ch_output))],
+            # Add AWGN noise: C code adds noise only to inner region
+            inner_start = config.pre_padding_length * config.osr
+            inner_count = oss_len - (config.pre_padding_length +
+                                     config.post_padding_length) * config.osr
+            noise_vec = np.array(
+                [gaussian_random(lcg_noise) for _ in range(inner_count)],
                 dtype=np.float64,
             )
-            ch_output = ch_output + ch_noise * noise_sigma
+            ch_output[inner_start: inner_start + inner_count] += noise_vec * noise_sigma
 
-            # LPF
-            lpf_output = lpf(ch_output, config.num_lpf_taps - 1, 1.0 / config.osr)
+            # LPF: C code calls LPF(ChannelOutput, OSSectorLength, ...)
+            ch_for_lpf = ch_output[:oss_len]
+            lpf_output = lpf(ch_for_lpf, config.num_lpf_taps - 1, 1.0 / config.osr)
 
-            # Downsampling: extract exactly encoded_len elements.
-            ds_start = config.pre_padding_length * config.osr
-            ds_stop = ds_start + encoded_len * config.osr
-            ds_output = lpf_output[ds_start: ds_stop: config.osr]
+            # Downsample: C code does DSOutput[i] = LPFOutput[i * OSR]
+            ds_output = lpf_output[:: config.osr][:padded_sector_length]
 
             # Equalization
             if config.equalizer_type == "FixedPRTarget":
@@ -468,12 +590,33 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
             # Detection
             det_sector_length = len(equalized)
             if config.detector_type == "Viterbi":
-                detected_hard, detected_soft = classical_viterbi(
-                    config.viterbi_delay, equalized, det_sector_length,
-                    gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
-                )
+                # Use constrained Viterbi if MTR/TMTR encoding is active
+                if config.use_encoding:
+                    if config.encoder_type == "mtr_6_7":
+                        detected_hard, detected_soft = viterbi_6by7mtr_code(
+                            config.viterbi_delay, equalized, config.pre_padding_length,
+                            det_sector_length,
+                            gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
+                        )
+                    elif config.encoder_type == "tmtr_8_9":
+                        detected_hard, detected_soft = viterbi_8by9tmtr_code(
+                            config.viterbi_delay, equalized, config.pre_padding_length,
+                            det_sector_length,
+                            gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
+                        )
+                    else:
+                        detected_hard, detected_soft = classical_viterbi(
+                            config.viterbi_delay, equalized, det_sector_length,
+                            gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
+                        )
+                else:
+                    detected_hard, detected_soft = classical_viterbi(
+                        config.viterbi_delay, equalized, det_sector_length,
+                        gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
+                    )
             elif config.detector_type == "SOVA":
-                detected_hard, detected_soft = classical_sova(
+                # Currently, constrained SOVA is not implemented, fallback to classical
+                detected_hard, detected_soft, _ = classical_sova(
                     config.viterbi_delay, equalized, det_sector_length,
                     gpr_target if config.equalizer_type == "GPRTarget" else pri_imp_res,
                     noise_sigma,
@@ -493,8 +636,15 @@ def run_simulation(config: SimulatorConfig) -> dict[str, Any]:
                 decoded = detected_hard.copy()
 
             # Count errors
-            compare_len = min(len(decoded), user_sector_length, len(user_bits))
-            bit_errors = int(np.sum(decoded[:compare_len] != user_bits[:compare_len]))
+            # The detector output corresponds to the full padded signal.
+            # Only compare the inner region (excluding padding), matching
+            # the C code which compares ViterbiHardOutput[i] with PaddedBits[i]
+            # for i in [PrePaddingLength, PrePaddingLength + SectorLength).
+            det_inner = detected_hard[
+                config.pre_padding_length: config.pre_padding_length + len(encoded)
+            ]
+            compare_len = min(len(det_inner), len(encoded))
+            bit_errors = int(np.sum(det_inner[:compare_len] != encoded[:compare_len]))
             total_bit_errors += bit_errors
 
             if bit_errors > 0:
@@ -596,7 +746,18 @@ def _plot_ber_snr(results: list[dict], config: SimulatorConfig) -> None:
     ber_vals = [r["ber"] for r in results]
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.semilogy(snr_vals, ber_vals, "bo-", linewidth=2, markersize=8)
+
+    # Replace 0 BER with minimum detectable BER for log-scale display
+    min_detectable = 1.0
+    for r in results:
+        nbits = r["num_sectors"] * config.sector_length
+        detectable = 0.5 / nbits if nbits > 0 else 1.0
+        if detectable < min_detectable:
+            min_detectable = detectable
+    min_detectable = max(min_detectable, 1e-15)
+    plot_ber = [max(r["ber"], min_detectable * 0.1) for r in results]
+
+    ax.semilogy(snr_vals, plot_ber, "bo-", linewidth=2, markersize=8)
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("Bit Error Rate (BER)")
     ax.set_title("HAMR Receiver Simulation: BER vs SNR")

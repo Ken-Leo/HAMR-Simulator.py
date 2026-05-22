@@ -225,7 +225,8 @@ def bisection(
 
     def _eval(x_pt: float) -> float:
         T_at = T_Peak * math.exp(-((z0 - d_val) ** 2) / (2.0 * sigma_t ** 2))
-        T_at *= math.exp(-((x_pt - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+        T_at *= math.exp(-((x_pt - c_val) ** 2) / (2.0 * sigma_t ** 2))
+        T_at += 300.0
         Hc_x = Hc[0] * T_at + Hc[1]
         Hh_x = (Hg / PI) * (
             math.atan((x_pt + g / 2.0) / y_val)
@@ -289,7 +290,8 @@ def Hd(
     y = YSTART
     while y <= YEND:
         T_y = T_Peak * math.exp(-((z0 - d) ** 2) / (2.0 * sigma_t ** 2))
-        T_y *= math.exp(-((y - c) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+        T_y *= math.exp(-((y - c) ** 2) / (2.0 * sigma_t ** 2))
+        T_y += 300.0
 
         dMy = (2.0 / PI) * -abs(Mr0 * T_y + Mr1) * (a / (a * a + (y - x0) ** 2))
         dMy += (
@@ -355,7 +357,8 @@ def bisection_tcentre(
 
     def _eval(x_pt: float) -> float:
         T_at = T_Peak * math.exp(-((z0 - d_val) ** 2) / (2.0 * sigma_t ** 2))
-        T_at *= math.exp(-((x_pt - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+        T_at *= math.exp(-((x_pt - c_val) ** 2) / (2.0 * sigma_t ** 2))
+        T_at += 300.0
         Hc_x = -abs(Hc[0] * T_at + Hc[1])
         Hh_x = (Hg / PI) * (
             math.atan((x_pt + g / 2.0) / y_val)
@@ -431,7 +434,8 @@ def bisection_tparam(
     y_val = pp.y
 
     T0 = T_Peak * math.exp(-((z0 - mp.d) ** 2) / (2.0 * sigma_t ** 2))
-    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2))
+    T0 += 300.0
 
     Mr0 = -abs(Mr[0] * T0 + Mr[1])
     Hc0 = -abs(Hc[0] * T0 + Hc[1])
@@ -516,7 +520,8 @@ def transition_large_spot(
     x0 = bisection(x1, x2, sigma_t, T_Peak, c_val, d_val, z0, Hc, Hg_val, g, y_val)
 
     T0 = T_Peak * math.exp(-((z0 - d_val) ** 2) / (2.0 * sigma_t ** 2))
-    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2))
+    T0 += 300.0
 
     dT = (
         T_Peak
@@ -568,7 +573,8 @@ def validate_answer(
     y_val = pp.y
 
     T0 = T_Peak * math.exp(-((z0 - mp.d) ** 2) / (2.0 * sigma_t ** 2))
-    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+    T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2))
+    T0 += 300.0
 
     Mr0 = -abs(Mr[0] * T0 + Mr[1])
     Hc0 = -abs(Hc[0] * T0 + Hc[1])
@@ -853,7 +859,8 @@ def microtrack(
 
             # Transition parameter evaluation
             T0 = T_Peak * math.exp(-((z0 - d_val) ** 2) / (2.0 * sigma_t ** 2))
-            T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2)) + 300.0
+            T0 *= math.exp(-((x0 - c_val) ** 2) / (2.0 * sigma_t ** 2))
+            T0 += 300.0
             dT = (
                 T_Peak
                 * math.exp(-((z0 - d_val) ** 2) / (2.0 * sigma_t ** 2))
@@ -976,6 +983,7 @@ def hamr_channel(
     temperature_modulation: int = 0,
     modulated_peak_temp: float = 0.0,
     trans_to_calc_trans_param: int = 0,
+    normalization_factor: float = 1.0,
     seed: int = -500,
 ) -> tuple:
     """Full HAMR channel simulation.
@@ -1065,7 +1073,11 @@ def hamr_channel(
 
     pi = PI
 
-    # Initialize readback signal
+    # Initialize readback signal (accumulated output).
+    # Must be large enough to hold the full oversampled domain signal.
+    readback_signal = [0.0] * length_padded
+
+    # Temporary microtrack buffer (size of X array)
     v = [0.0] * length
 
     # NLTS params (per track, index 0..N-1)
@@ -1088,7 +1100,7 @@ def hamr_channel(
         delta_d = []
 
     # Normalization factor (passed by reference via list)
-    normalization_factor = [1.0]
+    normalization_factor = [normalization_factor]
 
     # RNG states (separate streams for different noise sources)
     rng_temp = LCG(seed - 100) if seed < 0 else LCG(-(seed + 100))
@@ -1171,13 +1183,13 @@ def hamr_channel(
             # Accumulate into readback signal
             if oversampled_input_bits[i] - oversampled_input_bits[i - 1] > 0:
                 _accumulate_signal(
-                    v, readback_signal=0,
+                    v, readback_signal,
                     i=i, peak_amp_position_index=peak_amp_position_index,
                     length=length, length_padded=length_padded,
                 )
             elif oversampled_input_bits[i] - oversampled_input_bits[i - 1] < 0:
                 _accumulate_signal_neg(
-                    v,
+                    v, readback_signal,
                     i=i, peak_amp_position_index=peak_amp_position_index,
                     length=length, length_padded=length_padded,
                 )
@@ -1185,7 +1197,39 @@ def hamr_channel(
             # Reset v
             v = [0.0] * length
 
-    return v, pw50, peak_amp_position_index, normalization_factor[0]
+    # Calculate PW50 (pulse width at 50% of peak amplitude)
+    if readback_signal and max(abs(x) for x in readback_signal) > 0:
+        max_val = max(readback_signal)
+        min_val = min(readback_signal)
+        peak_val = max_val if abs(max_val) > abs(min_val) else min_val
+        half_val = peak_val / 2.0
+
+        # Find peak index
+        peak_idx = readback_signal.index(peak_val)
+
+        # Find left half-maximum point
+        left_idx = peak_idx
+        for i in range(peak_idx, -1, -1):
+            if readback_signal[i] <= half_val if peak_val > 0 else readback_signal[i] >= half_val:
+                left_idx = i
+                break
+
+        # Find right half-maximum point
+        right_idx = peak_idx
+        for i in range(peak_idx, len(readback_signal)):
+            if readback_signal[i] <= half_val if peak_val > 0 else readback_signal[i] >= half_val:
+                right_idx = i
+                break
+
+        # PW50 in nm (assuming x is sampled at 1nm intervals for initial calc)
+        if trans_to_calc_trans_param == 1:
+            # x is sampled at 1nm
+            pw50 = float(right_idx - left_idx)
+        else:
+            # x is sampled at over_sampled_bit_length intervals
+            pw50 = float(right_idx - left_idx) * oversampled_bit_length
+
+    return readback_signal, pw50, peak_amp_position_index, normalization_factor[0]
 
 
 def _get_peak_index(v: List[float], length: int) -> int:
@@ -1222,7 +1266,8 @@ def _accumulate_signal(
 
     temp = i - (peak_amp_position_index - start)
     for j in range(start, end):
-        readback_signal[temp] += v[j]
+        if 0 <= temp < len(readback_signal):
+            readback_signal[temp] += v[j]
         temp += 1
 
 
@@ -1249,5 +1294,6 @@ def _accumulate_signal_neg(
 
     temp = i - (peak_amp_position_index - start)
     for j in range(start, end):
-        readback_signal[temp] -= v[j]
+        if 0 <= temp < len(readback_signal):
+            readback_signal[temp] -= v[j]
         temp += 1

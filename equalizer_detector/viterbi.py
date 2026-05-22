@@ -9,6 +9,9 @@ Key pattern (matches C exactly):
 - Initialisation: all metrics = 1e50 except state 0 = 0.
 """
 
+from __future__ import annotations
+
+from typing import Callable
 import numpy as np
 
 _LARGE_METRIC: float = 1e50
@@ -19,6 +22,7 @@ def classical_viterbi(
     equalized_channel_output: np.ndarray,
     sector_length: int,
     pri_imp_res: np.ndarray,
+    constraint_callback: Callable[[int, int], bool] | None = None,
 ) -> tuple:
     """Classical Viterbi detector for a PRML channel.
 
@@ -27,11 +31,14 @@ def classical_viterbi(
     delay : int
         Detection delay (decision latency in bit periods).
     equalized_channel_output : np.ndarray
-        Received samples after equalisation (modified in-place).
+        Received samples after equalisation (NOT modified).
     sector_length : int
         Number of samples to decode.
     pri_imp_res : np.ndarray
         PR impulse response (e.g. ``[1, 1, -1, -1]`` for EPR4).
+    constraint_callback : Callable[[int, int], bool] | None
+        Optional callback to enforce code constraints.
+        Signature: `callback(k, state) -> bool` (True if valid).
 
     Returns
     -------
@@ -42,6 +49,11 @@ def classical_viterbi(
     """
     pri_imp_res_length = len(pri_imp_res)
     num_states = 1 << (pri_imp_res_length - 1)  # 2^(K-1)
+
+    # DC bias correction: for non-DC-free PR targets, subtract sum(pri)
+    # from the expected sample so that the branch metric for a correct
+    # hypothesis is zero.  (DC-free targets have sum(pri) = 0 → no effect.)
+    dc_bias = float(np.sum(pri_imp_res))
 
     # Path metric: ping-pong buffers  [2 x num_states]
     path_metric = np.full((2, num_states), _LARGE_METRIC, dtype=np.float64)
@@ -54,6 +66,9 @@ def classical_viterbi(
 
     min_path_metric_index = 0
 
+    # Output array — matches C: separate DetectedOutput array
+    detected_output = np.zeros(sector_length, dtype=np.float64)
+
     for k in range(sector_length):
         # Compute new metrics into buffer 1, read from buffer 0
         for i in range(num_states):
@@ -63,8 +78,7 @@ def classical_viterbi(
             sample0 = 0.0
             for j in range(pri_imp_res_length - 1):
                 sample0 += pri_imp_res[j] * ((i >> j) & 1)
-            sample0 = sample0 * 2.0
-
+            sample0 = sample0 * 2.0 - dc_bias
             prev_state0 = i >> 1
             metric0 = path_metric[0, prev_state0] + (
                 equalized_channel_output[k] - sample0
@@ -75,7 +89,7 @@ def classical_viterbi(
             for j in range(pri_imp_res_length - 1):
                 sample1 += pri_imp_res[j] * ((i >> j) & 1)
             sample1 += pri_imp_res[pri_imp_res_length - 1]
-            sample1 = sample1 * 2.0
+            sample1 = sample1 * 2.0 - dc_bias
 
             prev_state1 = (i >> 1) | (1 << (pri_imp_res_length - 2))
             metric1 = path_metric[0, prev_state1] + (
@@ -92,12 +106,17 @@ def classical_viterbi(
                 path[1, i, delay - 1] = i & 1
                 path_metric[1, i] = metric1
 
+            # ---- Apply Code Constraints ----
+            if constraint_callback is not None:
+                if not constraint_callback(k, i):
+                    path_metric[1, i] = _LARGE_METRIC
+
         # ---- Make decision on the bit transmitted ``delay`` bit
         #      periods ago ----
         if k >= delay - 1:
             min_path_metric_index = int(np.argmin(path_metric[1]))
             detected_bit = int(path[1, min_path_metric_index, 0])
-            equalized_channel_output[k - (delay - 1)] = float(detected_bit)
+            detected_output[k - (delay - 1)] = float(detected_bit)
 
         # ---- Ping-pong swap: copy buffer 1 -> buffer 0 ----
         path_metric[0] = path_metric[1].copy()
@@ -108,9 +127,9 @@ def classical_viterbi(
     for i in range(2, delay + 1):
         pos = sector_length - 1 - (delay - i)
         detected_bit = int(path[0, min_path_metric_index, i - 1])
-        equalized_channel_output[pos] = float(detected_bit)
+        detected_output[pos] = float(detected_bit)
 
-    return equalized_channel_output, pri_imp_res
+    return detected_output, pri_imp_res
 
 
 def classical_viterbi_sliding_window(

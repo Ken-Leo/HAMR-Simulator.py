@@ -1,0 +1,41 @@
+{
+  "RLL(4/5)": {
+    "status": "PASS",
+    "trials": 100,
+    "sector_length": 101,
+    "encoded_length": 126,
+    "compare_length": 81,
+    "total_errors": 0,
+    "total_bits": 8100,
+    "ber": 0.0,
+    "max_errors_per_sector": 0,
+    "total_invalid_codewords": 0,
+    "first_mismatch_positions": []
+  },
+  "MTR(6/7)": {
+    "status": "PASS",
+    "trials": 100,
+    "sector_length": 211,
+    "encoded_length": 246,
+    "compare_length": 181,
+    "total_errors": 0,
+    "total_bits": 18100,
+    "ber": 0.0,
+    "max_errors_per_sector": 0,
+    "total_invalid_codewords": 0,
+    "first_mismatch_positions": []
+  },
+  "TMTR(8/9)": {
+    "status": "PASS",
+    "trials": 100,
+    "sector_length": 361,
+    "encoded_length": 406,
+    "compare_length": 321,
+    "total_errors": 0,
+    "total_bits": 32100,
+    "ber": 0.0,
+    "max_errors_per_sector": 0,
+    "total_invalid_codewords": 0,
+    "first_mismatch_positions": []
+  }
+}

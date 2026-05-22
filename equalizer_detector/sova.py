@@ -7,8 +7,10 @@ outputs (reliability information / log-likelihood ratios) in
 addition to hard decisions.
 """
 
+from __future__ import annotations
+
 import math
-from typing import Tuple
+from typing import Callable
 
 import numpy as np
 
@@ -21,7 +23,8 @@ def classical_sova(
     sector_length: int,
     pri_imp_res: np.ndarray,
     noise_sigma: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    constraint_callback: Callable[[int, int], bool] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Soft-Output Viterbi Algorithm (SOVA).
 
     Parameters
@@ -36,6 +39,9 @@ def classical_sova(
         PR impulse response (e.g. ``[1, 1, -1, -1]`` for EPR4).
     noise_sigma : float
         Estimated noise standard deviation.
+    constraint_callback : Callable[[int, int], bool] | None
+        Optional callback to enforce code constraints.
+        Signature: `callback(k, state) -> bool` (True if valid).
 
     Returns
     -------
@@ -46,6 +52,9 @@ def classical_sova(
     """
     pri_imp_res_length = len(pri_imp_res)
     num_states = 1 << (pri_imp_res_length - 1)  # 2^(K-1)
+
+    # DC bias correction for non-DC-free PR targets
+    dc_bias = float(np.sum(pri_imp_res))
 
     noise_variance = noise_sigma * noise_sigma
 
@@ -78,10 +87,13 @@ def classical_sova(
             sample0 = 0.0
             for j in range(pri_imp_res_length - 1):
                 sample0 += pri_imp_res[j] * ((i >> j) & 1)
-            sample0 = sample0 * 2.0
+            sample0 = sample0 * 2.0 - dc_bias
+
+            cur = k & 1
+            prev = 1 - cur
 
             prev_state0 = i >> 1
-            metric0 = path_metric[0, prev_state0] + (
+            metric0 = path_metric[prev, prev_state0] + (
                 combined[k] - sample0
             ) ** 2
 
@@ -89,15 +101,12 @@ def classical_sova(
             for j in range(pri_imp_res_length - 1):
                 sample1 += pri_imp_res[j] * ((i >> j) & 1)
             sample1 += pri_imp_res[pri_imp_res_length - 1]
-            sample1 = sample1 * 2.0
+            sample1 = sample1 * 2.0 - dc_bias
 
             prev_state1 = (i >> 1) | (1 << (pri_imp_res_length - 2))
-            metric1 = path_metric[0, prev_state1] + (
+            metric1 = path_metric[prev, prev_state1] + (
                 combined[k] - sample1
             ) ** 2
-
-            cur = k & 1
-            prev = 1 - cur
 
             if k < (pri_imp_res_length - 1):
                 # Startup transient
@@ -142,13 +151,15 @@ def classical_sova(
             # Current-time probability of wrong decision
             prob_wrong_det[cur, i, delay - 1] = prob_wrong_surv
 
-            # Propagate to earlier bits
-            # differing_bits[j] is the path bit at position j.
-            # Check if the j-th bit position contributes differently.
+            # Propagate to earlier bits.
+            # DifferingBits[j] is 1 where the two incoming paths differ at
+            # position j in the delay buffer.  Position 0 is the oldest
+            # bit (already decided); we skip it and start from position 1.
+            # This matches the C code:
+            #   for(j=0;j<Delay-1;j++) { if(DifferingBits[j+1]==1) ... }
             for j in range(delay - 1):
                 bit_idx = delay - 2 - j
-                # Extract j-th bit from the j-th position of differing_bits
-                if ((differing_bits[j] >> j) & 1):
+                if differing_bits[j + 1]:
                     # Bits differ between the two paths
                     prob_wrong_det[cur, i, bit_idx] = (
                         prob_wrong_det[prev, surviving_state, delay - 1 - j]
@@ -165,6 +176,11 @@ def classical_sova(
                         prev, surviving_state, delay - 1 - j
                     ]
 
+            # ---- Apply Code Constraints ----
+            if constraint_callback is not None:
+                if not constraint_callback(k, i):
+                    path_metric[cur, i] = _LARGE_METRIC
+
         # ---- Make hard decision ----
         if k >= delay - 1:
             min_path_metric_index = int(np.argmin(path_metric[cur]))
@@ -179,14 +195,10 @@ def classical_sova(
                 soft_out = 1.0 - prob_wrong_det[cur, min_path_metric_index, 0]
             combined[pos + sector_length] = soft_out
 
-        # ---- Ping-pong swap ----
-        path_metric[prev] = path_metric[cur].copy()
-        path[prev] = path[cur].copy()
-        prob_wrong_det[prev] = prob_wrong_det[cur].copy()
-
-        path_metric[cur] = 0.0
-        path[cur] = 0
-        prob_wrong_det[cur] = 0.0
+        # ---- Ping-pong swap: copy computed buffer (cur) -> buffer 0 ----
+        path_metric[0] = path_metric[cur].copy()
+        path[0] = path[cur].copy()
+        prob_wrong_det[0] = prob_wrong_det[cur].copy()
 
         # ---- Swap valid-state lists ----
         if k < (pri_imp_res_length - 1):
@@ -206,16 +218,17 @@ def classical_sova(
     # Final traceback
     for i in range(2, delay + 1):
         pos = sector_length - 1 - (delay - i)
-        detected_bit = path[prev, min_path_metric_index, i - 1]
+        detected_bit = path[0, min_path_metric_index, i - 1]
         detected_hard_output[pos] = float(detected_bit)
 
         if detected_bit == 1:
             detected_soft_output[pos] = prob_wrong_det[
-                prev, min_path_metric_index, i - 1
+                0, min_path_metric_index, i - 1
             ]
         else:
             detected_soft_output[pos] = 1.0 - prob_wrong_det[
-                prev, min_path_metric_index, i - 1
+                0, min_path_metric_index, i - 1
             ]
 
+    detected_soft_output = np.clip(detected_soft_output, 1e-10, 1.0)
     return detected_hard_output, detected_soft_output, pri_imp_res

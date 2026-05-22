@@ -1,0 +1,35 @@
+Encode → Decode Identity Validation (zero noise)
+============================================================
+
+  RLL(4/5)  [PASS]
+    trials:              100
+    user_sector_length:  101
+    encoded_length:      126
+    valid_compare_len:   81
+    total_errors:        0
+    total_bits_compared: 8100
+    BER:                 0.0
+    max_errors/sector:   0
+    total_invalid_cw:    0
+
+  MTR(6/7)  [PASS]
+    trials:              100
+    user_sector_length:  211
+    encoded_length:      246
+    valid_compare_len:   181
+    total_errors:        0
+    total_bits_compared: 18100
+    BER:                 0.0
+    max_errors/sector:   0
+    total_invalid_cw:    0
+
+  TMTR(8/9)  [PASS]
+    trials:              100
+    user_sector_length:  361
+    encoded_length:      406
+    valid_compare_len:   321
+    total_errors:        0
+    total_bits_compared: 32100
+    BER:                 0.0
+    max_errors/sector:   0
+    total_invalid_cw:    0

@@ -6,6 +6,8 @@ Time-Varying Maximum Transition Run TMTR(2/3;11) constraint.
 Based on EncodingFunctions.c Enc_8By9TMTRCode.
 """
 
+from __future__ import annotations
+
 import math
 import pathlib
 

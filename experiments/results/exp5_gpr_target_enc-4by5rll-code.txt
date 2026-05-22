@@ -1,0 +1,3 @@
+# GPR Target - Channel: Perpendicular, Encoding: enc-4by5rll-code
+# Length: 5
+1.0000000000 1.0000000000 0.0000000000 -1.0000000000 -1.0000000000

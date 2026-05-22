@@ -136,8 +136,9 @@ class TestEqualizerIntegration:
         eq_coeff = np.zeros(21, dtype=np.float64)
 
         mse, lmse = adapt_equalizer(
-            data, data, eq_coeff, 21, 200, pri_imp_res,
-            pri_imp_res_length=4, start_flag=1,
+            pri_imp_res, eq_coeff, 21,
+            data, data, 200,
+            start_flag=1,
         )
 
         assert np.isfinite(mse)
@@ -152,12 +153,14 @@ class TestEqualizerIntegration:
         eq_coeff = np.zeros(21, dtype=np.float64)
 
         mse1, _ = adapt_equalizer(
-            data, data, eq_coeff, 21, 200, pri_imp_res,
-            pri_imp_res_length=4, start_flag=1,
+            pri_imp_res, eq_coeff, 21,
+            data, data, 200,
+            start_flag=1,
         )
         mse2, _ = adapt_equalizer(
-            data, data, eq_coeff, 21, 200, pri_imp_res,
-            pri_imp_res_length=4, start_flag=0,
+            pri_imp_res, eq_coeff, 21,
+            data, data, 200,
+            start_flag=0,
         )
 
         # MSE should decrease after second iteration (coefficients adapted)

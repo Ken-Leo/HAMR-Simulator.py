@@ -102,7 +102,8 @@ def uniform_random(idum: int = -1) -> LCG:
 def gaussian_random(lcg: LCG) -> float:
     """Return a Gaussian random number (mean=0, std=1).
 
-    Uses the Box-Muller transform.
+    Uses the Box-Muller transform.  One call consumes 2 uniform samples.
+    This is the non‑cached version.
     """
     while True:
         v1 = 2.0 * lcg.random() - 1.0
@@ -112,6 +113,50 @@ def gaussian_random(lcg: LCG) -> float:
             break
     factor = math.sqrt(-2.0 * math.log(s) / s)
     return v1 * factor
+
+
+def gaussian_raw(lcg: LCG) -> float:
+    """Return a single Gaussian random number (mean=0, std=1).
+
+    Uses Box-Muller – same as ``gaussian_random``.  This function exists
+    for some internal callers that use the name ``gaussian_raw``.
+    """
+    return gaussian_random(lcg)
+
+
+class CachedGaussian:
+    """Box-Muller Gaussian generator with caching, matching C's gasdev.
+
+    Internal state:
+      iset == 0 → generate 2 uniform samples, compute v1*fac/v2*fac,
+                  store v1*fac, return v2*fac, set iset=1.
+      iset == 1 → return stored v1*fac, set iset=0.
+
+    This halves the average number of uniform calls per Gaussian compared
+    to ``gaussian_random``.
+    """
+
+    def __init__(self, lcg: LCG) -> None:
+        """Wrap an LCG instance."""
+        self._lcg = lcg
+        self._is = 0
+        self._gs = 0.0
+
+    def __call__(self) -> float:
+        """Return the next Gaussian sample."""
+        if self._is == 0:
+            while True:
+                v1 = 2.0 * self._lcg.random() - 1.0
+                v2 = 2.0 * self._lcg.random() - 1.0
+                s = v1 * v1 + v2 * v2
+                if s < 1.0:
+                    break
+            fac = math.sqrt(-2.0 * math.log(s) / s)
+            self._gs = v1 * fac
+            self._is = 1
+            return v2 * fac
+        self._is = 0
+        return self._gs
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +179,8 @@ def autocorr(data: np.ndarray, seq_length: int, lag: int) -> float:
     """
     result = 0.0
     n = int(abs(lag))
-    if lag >= 0:
-        for i in range(seq_length - n):
-            result += data[i] * data[i + n]
-    else:
-        for i in range(seq_length - n):
-            result += data[i - n] * data[i]
+    for i in range(seq_length - n):
+        result += data[i] * data[i + n]
     return result
 
 
@@ -167,9 +208,19 @@ def mat_inverse(A: np.ndarray) -> np.ndarray:
     return np.linalg.inv(A)
 
 
+def matrix_inv(A: np.ndarray) -> np.ndarray:
+    """Alias for mat_inverse, matching C code naming."""
+    return mat_inverse(A)
+
+
 def mat_mult(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """Matrix multiplication."""
     return A @ B
+
+
+def matrix_mult(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Alias for mat_mult, matching C code naming."""
+    return mat_mult(A, B)
 
 
 def transpose(A: np.ndarray) -> np.ndarray:
@@ -212,6 +263,16 @@ def cross_corr(x: np.ndarray, x_len: int,
         for i in range(limit):
             result += x[i] * y[i + n]
     else:
+        limit = min(x_len, y_len - n)
         for i in range(limit):
-            result += x[i - n] * y[i]
+            result += x[i + n] * y[i]
     return result
+
+
+def erf(x: float) -> float:
+    """Error function, matching C ``erf()`` in MagneticDisk.c.
+
+    The C implementation uses ``gammp(0.5, x*x)`` with sign handling.
+    We delegate to ``math.erf`` for accuracy and performance.
+    """
+    return math.erf(x)
